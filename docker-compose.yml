@@ -92,9 +92,6 @@ services:
               count: 1
               capabilities: [gpu]
 
-  # bpipe_2 / bpipe_3 включаются через COMPOSE_PROFILES, который
-  # выставляет run.sh на основе BPIPE_REPLICAS из .env. Руками через
-  # `docker compose up` без run.sh не поднимутся.
   bpipe_2:
     profiles: ["bpipe2"]
     build:
@@ -173,8 +170,6 @@ services:
               count: 1
               capabilities: [gpu]
 
-  # Round-robin по конкретным URL из BPIPE_URLS (см. upipe.py itertools.cycle) —
-  # ровное распределение элементов, не зависит от DNS/keepalive.
   upipe:
     build:
       context: ./upipe
@@ -224,6 +219,7 @@ services:
       MIN_TEXT_LEN:        "${MIN_TEXT_LEN:-20}"
       MAX_TEXT_LEN:        "${MAX_TEXT_LEN:-20000}"
       MAX_OLDNESS_SECONDS: "${MAX_OLDNESS_SECONDS:-86400}"
+      FOREIGN_FORWARD_URL: "${FOREIGN_FORWARD_URL-http://192.168.0.100:9000/store_item}"
     ports:
       - "9000:9000"
     healthcheck:

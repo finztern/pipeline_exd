@@ -1,11 +1,3 @@
-"""
-Collector — мост между Twitter-скрапером и upipe.
-
-Схема:
-  scraper  → POST /store_item  (port 9000)  → collector
-  scraper  → POST /store_items (port 9000)  → collector
-  collector → POST /         (port 5981)  → upipe
-"""
 import asyncio
 import hashlib
 import logging
@@ -29,24 +21,24 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-UPIPE_URL       = os.getenv("UPIPE_URL", "http://127.0.0.1:5981/")
-COLLECTOR_PORT  = int(os.getenv("COLLECTOR_PORT", "9000"))
-MIN_TEXT_LEN         = int(os.getenv("MIN_TEXT_LEN", "20"))
-MAX_TEXT_LEN         = int(os.getenv("MAX_TEXT_LEN", "20000"))
+UPIPE_URL           = os.getenv("UPIPE_URL", "http://127.0.0.1:5981/")
+COLLECTOR_PORT      = int(os.getenv("COLLECTOR_PORT", "9000"))
+MIN_TEXT_LEN        = int(os.getenv("MIN_TEXT_LEN", "20"))
+MAX_TEXT_LEN        = int(os.getenv("MAX_TEXT_LEN", "20000"))
 MAX_OLDNESS_SECONDS = int(os.getenv("MAX_OLDNESS_SECONDS", "86400"))
-LANG_FILTER          = os.getenv("LANG_FILTER", "en").strip().lower()
-BPIPE_URLS           = [u.strip() for u in os.getenv("BPIPE_URLS", "http://bpipe:7995/").split(",") if u.strip()]
-UPIPE_QUEUE_LIMIT    = int(os.getenv("UPIPE_QUEUE_LIMIT", "200"))
-QUEUE_LOW_FILL       = float(os.getenv("QUEUE_LOW_FILL", "0.2"))
-QUEUE_HIGH_FILL      = float(os.getenv("QUEUE_HIGH_FILL", "0.7"))
+LANG_FILTER         = os.getenv("LANG_FILTER", "en").strip().lower()
+BPIPE_URLS          = [u.strip() for u in os.getenv("BPIPE_URLS", "http://bpipe:7995/").split(",") if u.strip()]
+UPIPE_QUEUE_LIMIT   = int(os.getenv("UPIPE_QUEUE_LIMIT", "200"))
+QUEUE_LOW_FILL      = float(os.getenv("QUEUE_LOW_FILL", "0.2"))
+QUEUE_HIGH_FILL     = float(os.getenv("QUEUE_HIGH_FILL", "0.7"))
+FOREIGN_FORWARD_URL = os.getenv("FOREIGN_FORWARD_URL", "http://192.168.0.101:9000/store_item").strip()
 
-# ─── Дедупликация ─────────────────────────────────────────────
 _seen_ids: OrderedDict = OrderedDict()
 _DEDUP_MAX_SIZE = 100_000
 
-# ─── Статистика ───────────────────────────────────────────────
-_stats = {"received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0, "truncated": 0, "errors": 0, "dropped": 0}
+_stats = {"received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0, "foreign_sent": 0, "truncated": 0, "errors": 0, "dropped": 0}
 _session: aiohttp.ClientSession | None = None
+_bg_tasks: set = set()
 
 
 def _hash_author(author: str) -> str:
@@ -74,6 +66,25 @@ async def forward_to_upipe(item: dict) -> bool:
         return False
 
 
+async def _send_foreign(item: dict):
+    try:
+        async with _session.post(FOREIGN_FORWARD_URL, data=orjson.dumps(item),
+                                  headers={"Content-Type": "application/json"},
+                                  timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            await resp.read()
+    except Exception as e:
+        log.debug(f"foreign forward error: {e}")
+
+
+def _forward_foreign(item: dict):
+    if not FOREIGN_FORWARD_URL or _session is None:
+        return
+    _stats["foreign_sent"] += 1
+    task = asyncio.create_task(_send_foreign(item))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
 def _parse_created_at(created_at_str: str) -> datetime | None:
     if not created_at_str:
         return None
@@ -88,14 +99,11 @@ def _parse_created_at(created_at_str: str) -> datetime | None:
         return None
 
 
-def _passes_lang_filter(content: str) -> bool:
-    if not LANG_FILTER:
-        return True
+def _detect_lang(content: str) -> str | None:
     try:
-        return detect(content) == LANG_FILTER
+        return detect(content)
     except LangDetectException:
-        # Неопределяемый язык — не пропускаем дальше без проверки, дропаем.
-        return False
+        return None
 
 
 async def _get_json(url: str) -> dict | None:
@@ -150,13 +158,13 @@ async def handle_queue(request: web.Request) -> web.Response:
 
 
 async def _process_item(item) -> str:
-    """Статусы: OK | duplicate | skipped_short | filtered_lang | filtered_old | invalid_item | dropped."""
     if not isinstance(item, dict) or not isinstance(item.get("content", ""), str):
         return "invalid_item"
 
     _stats["received"] += 1
     content = item.get("content", "")
 
+    raw_item = dict(item)
     item["author"] = _hash_author(item.get("author", ""))
 
     ext_id = item.get("external_id", "")
@@ -173,9 +181,13 @@ async def _process_item(item) -> str:
     if len(content) < MIN_TEXT_LEN:
         return "skipped_short"
 
-    if not _passes_lang_filter(content):
-        _stats["filtered_lang"] += 1
-        return "filtered_lang"
+    if LANG_FILTER:
+        lang = _detect_lang(content)
+        if lang != LANG_FILTER:
+            _stats["filtered_lang"] += 1
+            if lang is not None:
+                _forward_foreign(raw_item)
+            return "filtered_lang"
 
     if len(content) > MAX_TEXT_LEN:
         content = content[:MAX_TEXT_LEN]
@@ -197,7 +209,8 @@ async def _process_item(item) -> str:
         if _stats["forwarded"] % 50 == 0:
             log.info(
                 f"📊 recv={_stats['received']} fwd={_stats['forwarded']} "
-                f"old={_stats['filtered_old']} dup={_stats['filtered_dup']} lang={_stats['filtered_lang']} dropped={_stats['dropped']}"
+                f"old={_stats['filtered_old']} dup={_stats['filtered_dup']} lang={_stats['filtered_lang']} "
+                f"foreign={_stats['foreign_sent']} dropped={_stats['dropped']}"
             )
         return "OK"
 
@@ -245,6 +258,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "stats": _stats,
         "upipe": UPIPE_URL,
         "lang_filter": LANG_FILTER or None,
+        "foreign_forward_url": FOREIGN_FORWARD_URL or None,
     })
 
 
@@ -256,6 +270,7 @@ async def on_startup(app: web.Application):
     log.info(f"   Пересылает в upipe: {UPIPE_URL}")
     log.info(f"   Опрос очередей bpipe: {BPIPE_URLS}")
     log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
+    log.info(f"   Не-{LANG_FILTER} → {FOREIGN_FORWARD_URL or 'выключено'}")
     log.info(f"   Макс. возраст твита: {MAX_OLDNESS_SECONDS}с ({MAX_OLDNESS_SECONDS/3600:.1f}ч)")
 
 
