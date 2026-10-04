@@ -1,10 +1,19 @@
+"""
+Collector — мост между Twitter-скрапером и upipe.
+
+Схема:
+  scraper  → POST /store_item  (port 9000)  → collector
+  scraper  → POST /store_items (port 9000)  → collector
+  collector → POST /         (port 5981)  → upipe
+"""
 import asyncio
 import hashlib
 import logging
 import os
 import sys
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from datetime import datetime, timezone
+from urllib.parse import urljoin
 
 import aiohttp
 import orjson
@@ -26,12 +35,16 @@ MIN_TEXT_LEN         = int(os.getenv("MIN_TEXT_LEN", "20"))
 MAX_TEXT_LEN         = int(os.getenv("MAX_TEXT_LEN", "20000"))
 MAX_OLDNESS_SECONDS = int(os.getenv("MAX_OLDNESS_SECONDS", "86400"))
 LANG_FILTER          = os.getenv("LANG_FILTER", "en").strip().lower()
-BATCH_MAX_ITEMS      = int(os.getenv("BATCH_MAX_ITEMS", "1000"))
-BATCH_CONCURRENCY    = int(os.getenv("BATCH_CONCURRENCY", "20"))
+BPIPE_URLS           = [u.strip() for u in os.getenv("BPIPE_URLS", "http://bpipe:7995/").split(",") if u.strip()]
+UPIPE_QUEUE_LIMIT    = int(os.getenv("UPIPE_QUEUE_LIMIT", "200"))
+QUEUE_LOW_FILL       = float(os.getenv("QUEUE_LOW_FILL", "0.2"))
+QUEUE_HIGH_FILL      = float(os.getenv("QUEUE_HIGH_FILL", "0.7"))
 
+# ─── Дедупликация ─────────────────────────────────────────────
 _seen_ids: OrderedDict = OrderedDict()
 _DEDUP_MAX_SIZE = 100_000
 
+# ─── Статистика ───────────────────────────────────────────────
 _stats = {"received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0, "truncated": 0, "errors": 0, "dropped": 0}
 _session: aiohttp.ClientSession | None = None
 
@@ -81,12 +94,66 @@ def _passes_lang_filter(content: str) -> bool:
     try:
         return detect(content) == LANG_FILTER
     except LangDetectException:
+        # Неопределяемый язык — не пропускаем дальше без проверки, дропаем.
         return False
 
 
-async def _process_item(item: dict) -> str:
-    """Общий пайплайн фильтрации одного item. Возвращает message как в /store_item."""
-    global _stats
+async def _get_json(url: str) -> dict | None:
+    try:
+        async with _session.get(url, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json()
+    except Exception:
+        return None
+
+
+async def handle_queue(request: web.Request) -> web.Response:
+    upipe_data, *bpipe_data = await asyncio.gather(
+        _get_json(urljoin(UPIPE_URL, "health")),
+        *[_get_json(urljoin(u, "queue")) for u in BPIPE_URLS],
+    )
+
+    degraded = upipe_data is None or any(b is None or not b.get("ready") for b in bpipe_data)
+
+    upipe_queue = int((upipe_data or {}).get("queue", 0))
+    upipe_fill = upipe_queue / UPIPE_QUEUE_LIMIT if UPIPE_QUEUE_LIMIT else 0.0
+
+    live = [b for b in bpipe_data if b]
+    bpipe_queue = sum(b.get("queue", 0) for b in live)
+    bpipe_max = sum(b.get("max", 0) for b in live)
+    bpipe_inflight = sum(b.get("inflight", 0) for b in live)
+    bpipe_fill = bpipe_queue / bpipe_max if bpipe_max else 0.0
+
+    fill = max(upipe_fill, bpipe_fill)
+
+    if degraded or fill >= QUEUE_HIGH_FILL:
+        action = "slow_down"
+    elif fill <= QUEUE_LOW_FILL:
+        action = "speed_up"
+    else:
+        action = "hold"
+
+    return web.json_response({
+        "action": action,
+        "fill": round(fill, 3),
+        "low": QUEUE_LOW_FILL,
+        "high": QUEUE_HIGH_FILL,
+        "degraded": degraded,
+        "upipe_queue": upipe_queue,
+        "upipe_limit": UPIPE_QUEUE_LIMIT,
+        "bpipe_queue": bpipe_queue,
+        "bpipe_max": bpipe_max,
+        "bpipe_inflight": bpipe_inflight,
+        "bpipe_instances": len(BPIPE_URLS),
+    })
+
+
+async def _process_item(item) -> str:
+    """Статусы: OK | duplicate | skipped_short | filtered_lang | filtered_old | invalid_item | dropped."""
+    if not isinstance(item, dict) or not isinstance(item.get("content", ""), str):
+        return "invalid_item"
+
     _stats["received"] += 1
     content = item.get("content", "")
 
@@ -113,7 +180,7 @@ async def _process_item(item: dict) -> str:
     if len(content) > MAX_TEXT_LEN:
         content = content[:MAX_TEXT_LEN]
         item["content"] = content
-        _stats["truncated"] = _stats.get("truncated", 0) + 1
+        _stats["truncated"] += 1
 
     created_at_str = item.get("created_at", "")
     tweet_dt = _parse_created_at(created_at_str)
@@ -125,21 +192,20 @@ async def _process_item(item: dict) -> str:
     else:
         log.warning(f"⚠️ Не удалось распарсить created_at: {created_at_str!r}")
 
-    ok = await forward_to_upipe(item)
-    if ok:
+    if await forward_to_upipe(item):
         _stats["forwarded"] += 1
         if _stats["forwarded"] % 50 == 0:
             log.info(
                 f"📊 recv={_stats['received']} fwd={_stats['forwarded']} "
                 f"old={_stats['filtered_old']} dup={_stats['filtered_dup']} lang={_stats['filtered_lang']} dropped={_stats['dropped']}"
             )
-    else:
-        _stats["errors"] += 1
-        _stats["dropped"] += 1
-        if _stats["dropped"] % 10 == 0:
-            log.warning(f"⚠️  Потеряно элементов (upipe недоступен/503): {_stats['dropped']}")
+        return "OK"
 
-    return "OK"
+    _stats["errors"] += 1
+    _stats["dropped"] += 1
+    if _stats["dropped"] % 10 == 0:
+        log.warning(f"⚠️  Потеряно элементов (upipe недоступен/503): {_stats['dropped']}")
+    return "dropped"
 
 
 async def handle_store_item(request: web.Request) -> web.Response:
@@ -148,50 +214,29 @@ async def handle_store_item(request: web.Request) -> web.Response:
     except Exception as e:
         return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
 
-    message = await _process_item(item)
-    return web.json_response({"message": message}, status=200)
+    status = await _process_item(item)
+    if status == "invalid_item":
+        return web.json_response({"error": "expected JSON object with string 'content'"}, status=400)
+    return web.json_response({"message": "OK" if status == "dropped" else status}, status=200)
 
 
-async def handle_store_batch(request: web.Request) -> web.Response:
+async def handle_store_items(request: web.Request) -> web.Response:
     try:
-        items = await request.json()
+        data = await request.json()
     except Exception as e:
         return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
 
-    if not isinstance(items, list):
-        return web.json_response({"error": "expected array"}, status=400)
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        data = data["items"]
+    if not isinstance(data, list):
+        return web.json_response({"error": "expected JSON array or {\"items\": [...]}"}, status=400)
 
-    if not items:
-        return web.json_response({"received": 0, "results": []}, status=200)
-
-    if len(items) > BATCH_MAX_ITEMS:
-        return web.json_response(
-            {"error": f"batch too large: {len(items)} > {BATCH_MAX_ITEMS}"}, status=413
-        )
-
-    sem = asyncio.Semaphore(BATCH_CONCURRENCY)
-
-    async def _guarded(it):
-        if not isinstance(it, dict):
-            return "invalid_item"
-        async with sem:
-            try:
-                return await _process_item(it)
-            except Exception as e:
-                log.warning(f"Ошибка обработки item в батче: {e}")
-                return "error"
-
-    results = await asyncio.gather(*[_guarded(it) for it in items])
-
-    summary: dict = {}
-    for r in results:
-        summary[r] = summary.get(r, 0) + 1
-
-    log.info(f"📦 Батч обработан: {len(items)} элементов | {summary}")
-
-    return web.json_response(
-        {"received": len(items), "summary": summary, "results": results}, status=200
-    )
+    statuses = await asyncio.gather(*(_process_item(i) for i in data))
+    return web.json_response({
+        "message": "OK",
+        "count": len(data),
+        "results": dict(Counter(statuses)),
+    }, status=200)
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -200,7 +245,6 @@ async def handle_health(request: web.Request) -> web.Response:
         "stats": _stats,
         "upipe": UPIPE_URL,
         "lang_filter": LANG_FILTER or None,
-        "batch_max_items": BATCH_MAX_ITEMS,
     })
 
 
@@ -210,9 +254,9 @@ async def on_startup(app: web.Application):
     _session = aiohttp.ClientSession(connector=connector)
     log.info(f"🚀 Collector запущен на порту {COLLECTOR_PORT}")
     log.info(f"   Пересылает в upipe: {UPIPE_URL}")
+    log.info(f"   Опрос очередей bpipe: {BPIPE_URLS}")
     log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
     log.info(f"   Макс. возраст твита: {MAX_OLDNESS_SECONDS}с ({MAX_OLDNESS_SECONDS/3600:.1f}ч)")
-    log.info(f"   Батчи: до {BATCH_MAX_ITEMS} items, конкурентность {BATCH_CONCURRENCY}")
 
 
 async def on_shutdown(app: web.Application):
@@ -224,7 +268,8 @@ async def on_shutdown(app: web.Application):
 
 app = web.Application(client_max_size=50 * 1024 * 1024)
 app.router.add_post("/store_item", handle_store_item)
-app.router.add_post("/store_items", handle_store_batch)
+app.router.add_post("/store_items", handle_store_items)
+app.router.add_get("/queue", handle_queue)
 app.router.add_get("/health", handle_health)
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)

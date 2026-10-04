@@ -1,3 +1,9 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
 
   vpn:
@@ -179,8 +185,6 @@ services:
       UPIPE_QUEUE_LIMIT:        "${UPIPE_QUEUE_LIMIT:-200}"
       MAX_DEPTH_CLASSIFICATION: "${MAX_DEPTH_CLASSIFICATION:-2}"
       MAX_MODEL_TOKENS:         "${MAX_MODEL_TOKENS:-400}"
-      LANG_MIN_CONFIDENCE:      "${LANG_MIN_CONFIDENCE:-0.9}"
-      LANG_DETECT_MIN_LEN:      "${LANG_DETECT_MIN_LEN:-30}"
       USE_PROXY:                "${USE_PROXY_UPIPE:-false}"
       PROXY_URL:                "http://vpn:1081"
     expose:
@@ -205,9 +209,11 @@ services:
     environment:
       COLLECTOR_PORT:      "9000"
       UPIPE_URL:           "http://upipe:5981/"
+      BPIPE_URLS:          "${BPIPE_URLS:-http://bpipe:7995/}"
+      UPIPE_QUEUE_LIMIT:   "${UPIPE_QUEUE_LIMIT:-200}"
+      QUEUE_LOW_FILL:      "${QUEUE_LOW_FILL:-0.2}"
+      QUEUE_HIGH_FILL:     "${QUEUE_HIGH_FILL:-0.7}"
       LANG_FILTER:         "${LANG_FILTER:-en}"
-      LANG_MIN_CONFIDENCE: "${LANG_MIN_CONFIDENCE:-0.9}"
-      LANG_DETECT_MIN_LEN: "${LANG_DETECT_MIN_LEN:-30}"
       MIN_TEXT_LEN:        "${MIN_TEXT_LEN:-20}"
       MAX_TEXT_LEN:        "${MAX_TEXT_LEN:-20000}"
       MAX_OLDNESS_SECONDS: "${MAX_OLDNESS_SECONDS:-86400}"

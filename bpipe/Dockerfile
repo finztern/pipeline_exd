@@ -11,15 +11,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# ВАЖНО: torch запинен на версию из ТОЙ ЖЕ эпохи, что и transformers/
-# optimum/sentence-transformers ниже (все — ноябрь 2024). Раньше здесь была
-# незапиненная "latest" версия torch — а это на 1.5-2 года новее всего
-# остального стека. 2.5.1 — стабильный релиз, современник
-# transformers==4.46.3 / optimum==1.23.3.
+# ВАЖНО: ВСЕ python-зависимости ставятся ОДНОЙ командой pip install, чтобы
+# pip резолвил их как единый граф. Раньше torch ставился отдельным RUN'ом
+# (с --index-url cu121), а весь остальной стек — вторым, независимым
+# RUN'ом. Каждый RUN — отдельный вызов pip с чистым резолвером: второй
+# RUN не видел constraint из первого и либо (а) молча апгрейдил torch до
+# последней версии с обычного PyPI (2.14.0+cu130 — собран под CUDA новее
+# драйвера хоста → CUDA недоступна), либо (б) при попытке зафиксировать
+# torch==2.5.1+cu121 ЕЩЁ РАЗ упирался в конфликт версий nvidia-cudnn-cu12
+# (torch 2.5.1+cu121 жёстко требует ==9.1.0.70, а мы параллельно пинили
+# ==9.3.0.75 — ResolutionImpossible).
+#
+# Решение: --index-url на индекс PyTorch (там нужная cu121-сборка torch
+# и её родная зависимость nvidia-cudnn-cu12==9.1.0.70) + --extra-index-url
+# на обычный PyPI (для того, чего на индексе PyTorch нет — transformers,
+# optimum, cupy и т.д.). Один резолвер, один согласованный граф. Версию
+# nvidia-cudnn-cu12 здесь НЕ пинуем вручную — 9.1.0.70 (то, что тянет сам
+# torch) — это тоже cuDNN 9.x, чего достаточно для onnxruntime-gpu==1.20.2.
 RUN pip3 install --no-cache-dir \
-    torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
-
-RUN pip3 install --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cu121 \
+    --extra-index-url https://pypi.org/simple \
+    torch==2.5.1 \
     cupy-cuda12x \
     "aiohttp>=3.9.0" \
     "orjson>=3.9.0" \
@@ -28,7 +40,6 @@ RUN pip3 install --no-cache-dir \
     "optimum==1.23.3" \
     "onnx>=1.16.0" \
     "onnxruntime-gpu==1.20.2" \
-    "nvidia-cudnn-cu12==9.3.0.75" \
     "sentence-transformers==3.3.1" \
     "argostranslate>=1.9.0" \
     "vaderSentiment>=3.3.2" \
@@ -36,6 +47,10 @@ RUN pip3 install --no-cache-dir \
     httpx[socks] socksio \
     "aioprometheus>=23.0.0" \
     opentelemetry-api
+
+# Проверка на этапе сборки, что реально встал torch нужной эпохи —
+# падает сразу при сборке образа, а не тихо в рантайме через месяц.
+RUN python3 -c "import torch; assert torch.__version__.startswith('2.5.1'), f'torch версии {torch.__version__}, ожидался 2.5.1'; assert torch.version.cuda == '12.1', f'torch собран под CUDA {torch.version.cuda}, ожидался 12.1'; print(f'✅ torch {torch.__version__} (cuda {torch.version.cuda})')"
 
 # ВАЖНО: optimum==1.23.3 (даже БЕЗ extras [onnxruntime-gpu]) тянет обычный
 # CPU-пакет `onnxruntime` как скрытую зависимость. Пакеты `onnxruntime` и
@@ -60,9 +75,10 @@ RUN pip3 install --no-cache-dir --force-reinstall --no-deps onnxruntime-gpu==1.2
 # runtime (cudart/cublas), но НЕ cuDNN. onnxruntime-gpu>=1.19 требует
 # cuDNN 9.x (libcudnn.so.9), иначе CUDAExecutionProvider тихо пропадает
 # из списка доступных провайдеров, и всё уезжает на CPU. cuDNN здесь
-# ставится pip-пакетом nvidia-cudnn-cu12 (см. выше), а не системно — его
-# .so лежат в site-packages, вне стандартных путей линковщика. Основной
-# способ найти их — onnxruntime.preload_dlls() в коде (lab_initialization.py);
+# ставится pip-пакетом nvidia-cudnn-cu12 (транзитивная зависимость torch,
+# см. выше), а не системно — его .so лежат в site-packages, вне
+# стандартных путей линковщика. Основной способ найти их —
+# onnxruntime.preload_dlls() в коде (lab_initialization.py);
 # LD_LIBRARY_PATH ниже — резервный вариант на случай, если preload_dlls
 # недоступен в конкретной версии onnxruntime. Путь проверяем на этапе
 # сборки (падает сразу, если что-то пошло не так, а не тихо в рантайме).

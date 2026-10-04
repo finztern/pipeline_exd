@@ -61,6 +61,7 @@ _process_queue: asyncio.Queue | None = None
 _lab_config: dict | None = None
 _live_config = None
 _session: aiohttp.ClientSession | None = None
+_inflight = 0
 _stats = {
     "received": 0,
     "batches_processed": 0,
@@ -129,7 +130,7 @@ async def batch_processing_loop():
       - набралось FIXED_BATCH_SIZE элементов, ИЛИ
       - прошло BATCH_TIMEOUT_SECS с момента появления первого элемента в батче
     """
-    global _stats
+    global _stats, _inflight
 
     loop = asyncio.get_event_loop()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bpipe_ml")
@@ -162,6 +163,7 @@ async def batch_processing_loop():
                     timeout=timeout,
                 )
                 batch.append(item)
+                _inflight = len(batch)
                 if first_item_time is None:
                     first_item_time = time.monotonic()
             except asyncio.TimeoutError:
@@ -192,6 +194,8 @@ async def batch_processing_loop():
         except Exception as e:
             _stats["errors"] += 1
             log.error(f"[Batch-{batch_id}] ❌ Ошибка обработки: {e}", exc_info=True)
+        finally:
+            _inflight = 0
 
 
 # ─── HTTP обработчики ──────────────────────────────────────────
@@ -213,7 +217,6 @@ async def handle_receive_item(request: web.Request) -> web.Response:
         author_value         = raw_item["item"].get("author") or ""
         title_value          = raw_item["item"].get("title") or ""
         ext_parent_id        = raw_item["item"].get("external_parent_id") or ""
-        summary_value        = raw_item["item"].get("summary") or ""
 
         processed_item = Processed(
             classification=Classification(
@@ -240,8 +243,6 @@ async def handle_receive_item(request: web.Request) -> web.Response:
             processed_item.item["external_parent_id"] = ExternalParentId(ext_parent_id)
         if raw_item["item"].get("username"):
             processed_item.item["username"] = Username(raw_item["item"]["username"])
-        if summary_value:
-            processed_item.item["summary"] = summary_value
 
     except Exception as e:
         log.warning(f"Ошибка создания Processed: {e}")
@@ -277,6 +278,19 @@ async def handle_health(request: web.Request) -> web.Response:
         "queue": _process_queue.qsize() if _process_queue else 0,
         "stats": _stats,
         "batch_size": FIXED_BATCH_SIZE,
+    })
+
+
+async def handle_queue(request: web.Request) -> web.Response:
+    size = _process_queue.qsize() if _process_queue else 0
+    return web.json_response({
+        "ready": _process_queue is not None,
+        "queue": size,
+        "max": MAX_QUEUE_SIZE,
+        "fill": round(size / MAX_QUEUE_SIZE, 3) if MAX_QUEUE_SIZE else 0.0,
+        "inflight": _inflight,
+        "batch_size": FIXED_BATCH_SIZE,
+        "dropped": _stats["dropped"],
     })
 
 
@@ -328,6 +342,7 @@ app = web.Application(client_max_size=500 * 1024 * 1024)
 app.router.add_post("/", handle_receive_item)
 app.router.add_get("/", handle_health)
 app.router.add_get("/health", handle_health)
+app.router.add_get("/queue", handle_queue)
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 

@@ -82,10 +82,7 @@ def initialize_models(device):
         _zs_tokenizer.model_max_length = 512
     else:
         _zs_tokenizer.model_max_length = min(_zs_tokenizer.model_max_length, 512)
-    # fp16 только на GPU (device>=0) — на CPU половинная точность не ускоряет,
-    # а местами вообще не поддерживается ядрами PyTorch.
-    _dtype = torch.float16 if device >= 0 else None
-    _zs_model = AutoModelForSequenceClassification.from_pretrained(_zs_id, torch_dtype=_dtype)
+    _zs_model = AutoModelForSequenceClassification.from_pretrained(_zs_id)
     models["zs_pipe"] = pipeline(
         "zero-shot-classification",
         model=_zs_model,
@@ -119,7 +116,7 @@ def initialize_models(device):
         _tokenizer = AutoTokenizer.from_pretrained(source_id)
         if not _tokenizer.model_max_length or _tokenizer.model_max_length > 100_000:
             _tokenizer.model_max_length = 512
-        _model = AutoModelForSequenceClassification.from_pretrained(source_id, torch_dtype=_dtype)
+        _model = AutoModelForSequenceClassification.from_pretrained(source_id)
         models[col_name] = pipeline(
             "text-classification",
             model=_model,
@@ -163,7 +160,7 @@ def initialize_models(device):
     _fdb_tokenizer = AutoTokenizer.from_pretrained(_fdb_id)
     if not _fdb_tokenizer.model_max_length or _fdb_tokenizer.model_max_length > 100_000:
         _fdb_tokenizer.model_max_length = 512
-    _fdb_model = AutoModelForSequenceClassification.from_pretrained(_fdb_id, torch_dtype=_dtype)
+    _fdb_model = AutoModelForSequenceClassification.from_pretrained(_fdb_id)
     models["fdb_pipe"] = pipeline(
         "text-classification",
         model=_fdb_model,
@@ -226,11 +223,6 @@ def lab_initialization():
             timeout=30,
         ).json()
         logging.info("[LAB INIT] Classification labels loaded.")
-        logging.info(
-            f"[LAB INIT] Zero-shot labels count: {len(labels)} — "
-            f"zs_pipe считает NLI-проход batch_size×{len(labels)} пар текст/лейбл на КАЖДЫЙ батч, "
-            f"это главный множитель нагрузки на zs_pipe (см. tag.py)"
-        )
     except Exception as e:
         logging.error(f"[LAB INIT] Labels fetch failed: {e}")
         # Пустой labeldict → classification_labels=[] в tag.py → zs_pipe падает →

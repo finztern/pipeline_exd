@@ -1,4 +1,5 @@
 import logging
+import os
 import cupy as cp
 import torch
 import gc
@@ -26,6 +27,20 @@ def clear_gpu_memory():
     except Exception as e:
         logging.warning(f"Error clearing GPU memory: {e}")
 
+def soft_clear_gpu_cache():
+    """
+    Дешёвая версия clear_gpu_memory(): только empty_cache(), без device
+    synchronize() и без gc.collect(). Отдаёт неиспользуемые закэшированные
+    PyTorch-блоки обратно CUDA-аллокатору (важно при 3+ репликах на одной
+    физической GPU — иначе reserved-память каждого процесса растёт и не
+    возвращается), но не даёт полного стопа CPU-стороны конвейера.
+    """
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:
+        logging.warning(f"Error in soft_clear_gpu_cache: {e}")
+
 def get_gpu_memory_info():
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3
@@ -47,7 +62,6 @@ def tag(documents: list[str], lab_configuration):
     classification_labels = list(lab_configuration["labeldict"].keys())
     sentiment_analyzer = models['sentiment_analyzer']
     fdb_pipe = models['fdb_pipe']
-    gdb_pipe = models['gdb_pipe']
 
     text_classification_models = {
         "Emotion": models['Emotion'],
@@ -55,7 +69,11 @@ def tag(documents: list[str], lab_configuration):
         "TextType": models['TextType']
     }
 
-    batch_size = 15
+    # batch_size=len(documents) (один форвард-проход вместо ceil(32/15)=3) убыстряет,
+    # но поднимает ПИК активаций за шаг — с 3 репликами на одной GPU (7.78GiB суммарно)
+    # это и уронило нас в OOM. TAG_HF_BATCH_SIZE даёт крутилку без правки кода:
+    # меньше — безопаснее по памяти, больше — быстрее за счёт меньшего числа проходов.
+    batch_size = min(len(documents), int(os.getenv("TAG_HF_BATCH_SIZE", "32")))
     logging.info(f"Using batch_size: {batch_size} for {len(documents)} documents")
 
     # Защита от ошибок на слишком длинных текстах: даже если что-то
@@ -78,8 +96,8 @@ def tag(documents: list[str], lab_configuration):
             show_progress_bar=False
         )
         embedding_vectors = embedding_vectors.cpu().numpy()
+        soft_clear_gpu_cache()
 
-        clear_gpu_memory()
         allocated_after_emb, _ = get_gpu_memory_info()
         logging.info(f"GPU Memory after embeddings: {allocated_after_emb:.2f}GB")
 
@@ -88,24 +106,27 @@ def tag(documents: list[str], lab_configuration):
         # версий) — поэтому HF_SAFETY_KWARGS здесь не передаём. Защита обеспечена
         # tokenizer.model_max_length=512 в lab_initialization.py + обрезкой в upipe.
         classification_results = zs_pipe(documents, candidate_labels=classification_labels, batch_size=batch_size)
-        clear_gpu_memory()
+        soft_clear_gpu_cache()
 
         logging.info("Processing text classification...")
         text_type_results = text_classification_models['TextType'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
-        clear_gpu_memory()
+        soft_clear_gpu_cache()
 
         emotion_results = text_classification_models['Emotion'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
-        clear_gpu_memory()
+        soft_clear_gpu_cache()
 
         irony_results = text_classification_models['Irony'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
-        clear_gpu_memory()
+        soft_clear_gpu_cache()
 
         logging.info("Processing sentiment analysis...")
         fdb_predictions = fdb_pipe(documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
-        clear_gpu_memory()
+        soft_clear_gpu_cache()
 
-        gdb_predictions = gdb_pipe(documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
-        clear_gpu_memory()
+        # Полный clear_gpu_memory() (synchronize+gc.collect) между шагами убран —
+        # это блокирующий барьер + стоп Python-рантайма, основной вклад в 4.78с/батч.
+        # Вместо него — soft_clear_gpu_cache() (только empty_cache): отдаёт кэш
+        # CUDA-аллокатора без полной синхронизации, чего хватает, чтобы 3 реплики
+        # не съедали весь 7.78GiB построчно без возврата памяти.
 
         logging.info("Processing VADER sentiment...")
         vader_scores = [sentiment_analyzer.polarity_scores(text)["compound"] for text in documents]
@@ -192,20 +213,20 @@ def tag(documents: list[str], lab_configuration):
             fdb_sentiment_dict = {e["label"]: round(e["score"], 3) for e in fdb_prediction}
             fdb_sent_score = round(fdb_sentiment_dict.get("positive", 0.0) - fdb_sentiment_dict.get("negative", 0.0), 3)
 
-            gdb_prediction = gdb_predictions[idx]
-            gdb_sentiment_dict = {e["label"]: round(e["score"], 3) for e in gdb_prediction}
-            gdb_sent_score = round(gdb_sentiment_dict.get("positive", 0.0) - gdb_sentiment_dict.get("negative", 0.0), 3)
-
             compounded_fin_sentiment = round((0.70 * fdb_sent_score + 0.30 * fin_vader_sent_score), 2)
 
+            # gdb_pipe (general multilingual sentiment) убран из формулы вместе с моделью
+            # (см. lab_initialization.py). Веса, ранее уходившие на gdb, перераспределены
+            # на vader/finvader — при сильном финсигнале доминирует compounded_fin_sentiment,
+            # при слабом — vader+finvader как общий сентимент-бэкап.
             if abs(compounded_fin_sentiment) >= 0.6:
-                sentiment_score = round((0.30 * gdb_sent_score + 0.10 * vader_sent_score + 0.60 * compounded_fin_sentiment), 2)
+                sentiment_score = round((0.15 * vader_sent_score + 0.85 * compounded_fin_sentiment), 2)
             elif abs(compounded_fin_sentiment) >= 0.4:
-                sentiment_score = round((0.40 * gdb_sent_score + 0.20 * vader_sent_score + 0.40 * compounded_fin_sentiment), 2)
+                sentiment_score = round((0.35 * vader_sent_score + 0.65 * compounded_fin_sentiment), 2)
             elif abs(compounded_fin_sentiment) >= 0.1:
-                sentiment_score = round((0.60 * gdb_sent_score + 0.25 * vader_sent_score + 0.15 * compounded_fin_sentiment), 2)
+                sentiment_score = round((0.60 * vader_sent_score + 0.40 * compounded_fin_sentiment), 2)
             else:
-                sentiment_score = round((0.60 * gdb_sent_score + 0.40 * vader_sent_score), 2)
+                sentiment_score = round((0.50 * vader_sent_score + 0.50 * fin_vader_sent_score), 2)
 
             sentiment = Sentiment(sentiment_score)
 
