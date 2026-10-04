@@ -11,6 +11,7 @@ services:
       context: ./vpn
     container_name: vpn
     restart: unless-stopped
+    logging: *default-logging
     environment:
       VLESS_URL:     "${VLESS_URL}"
       SOCKS_PORT:    "1080"
@@ -32,6 +33,7 @@ services:
       context: ./transactioneer
     container_name: transactioneer
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       vpn:
         condition: service_healthy
@@ -57,6 +59,7 @@ services:
       context: ./bpipe
     container_name: bpipe
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       transactioneer:
         condition: service_healthy
@@ -98,6 +101,7 @@ services:
       context: ./bpipe
     container_name: bpipe_2
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       transactioneer:
         condition: service_healthy
@@ -136,6 +140,7 @@ services:
       context: ./bpipe
     container_name: bpipe_3
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       transactioneer:
         condition: service_healthy
@@ -175,6 +180,7 @@ services:
       context: ./upipe
     container_name: upipe
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       bpipe:
         condition: service_healthy
@@ -203,6 +209,7 @@ services:
       context: ./collector
     container_name: collector
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       upipe:
         condition: service_healthy
