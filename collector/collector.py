@@ -1,10 +1,13 @@
 import asyncio
 import hashlib
 import logging
+import multiprocessing as mp
 import os
 import sys
 import time
 from collections import Counter, OrderedDict
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
@@ -42,6 +45,10 @@ TRANSLATE_BUSY_FILL   = float(os.getenv("TRANSLATE_BUSY_FILL", "0.9"))
 TRANSLATE_POLL_SEC    = float(os.getenv("TRANSLATE_POLL_SECONDS", "1.0"))
 LANG_CONFIDENCE       = float(os.getenv("LANG_CONFIDENCE_THRESHOLD", "0.90"))
 
+DETECT_WORKERS        = int(os.getenv("DETECT_WORKERS", "3"))
+DETECT_MAX_CHARS      = int(os.getenv("DETECT_MAX_CHARS", "1000"))
+UPIPE_RETRY_SECONDS   = float(os.getenv("UPIPE_RETRY_SECONDS", "3.0"))
+
 LANG_ALIASES = {"zh-cn": "zh", "zh-tw": "zt", "no": "nb"}
 
 _seen_ids: OrderedDict = OrderedDict()
@@ -51,12 +58,14 @@ _started = time.time()
 _stats = {
     "received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0,
     "foreign_sent": 0, "to_translate": 0, "truncated": 0, "errors": 0, "dropped": 0,
+    "upipe_retries": 0,
 }
 _langs_seen: Counter = Counter()
 _foreign_reasons: Counter = Counter()
 _tr_state = {"ok": False, "fill": 1.0, "installed": frozenset()}
 _session: aiohttp.ClientSession | None = None
 _bg_tasks: set = set()
+_detect_pool: ProcessPoolExecutor | None = None
 
 
 def _norm_lang(lang: str) -> str:
@@ -69,23 +78,64 @@ def _hash_author(author: str) -> str:
     return hashlib.sha1(author.encode("utf-8")).hexdigest()
 
 
+def _detect_lang(content: str) -> tuple[str | None, float]:
+    try:
+        res = detect_langs(content)
+    except LangDetectException:
+        return None, 0.0
+    if not res:
+        return None, 0.0
+    return res[0].lang, float(res[0].prob)
+
+
+def _new_detect_pool() -> ProcessPoolExecutor:
+    # langdetect — чистый Python под GIL; в event loop он упирался в 1 ядро
+    return ProcessPoolExecutor(
+        max_workers=DETECT_WORKERS,
+        mp_context=mp.get_context("spawn"),
+        initializer=_detect_lang,
+        initargs=("warm up the language detector profiles",),
+    )
+
+
+async def _detect_lang_async(content: str) -> tuple[str | None, float]:
+    global _detect_pool
+    text = content[:DETECT_MAX_CHARS]
+    pool = _detect_pool
+    try:
+        return await asyncio.get_running_loop().run_in_executor(pool, _detect_lang, text)
+    except BrokenProcessPool:
+        if pool is _detect_pool:
+            log.error("❌ detect pool сломан — пересоздаю")
+            _detect_pool = _new_detect_pool()
+            pool.shutdown(wait=False)
+        return _detect_lang(text)
+
+
 async def forward_to_upipe(item: dict) -> bool:
     global _session
     if _session is None:
         return False
-    try:
-        async with _session.post(UPIPE_URL, data=orjson.dumps(item),
-                                  headers={"Content-Type": "application/json"}) as resp:
-            if 200 <= resp.status < 300:
-                return True
-            log.warning(f"upipe ответил {resp.status}")
+    data = orjson.dumps(item)
+    deadline = time.monotonic() + UPIPE_RETRY_SECONDS
+    while True:
+        try:
+            async with _session.post(UPIPE_URL, data=data,
+                                      headers={"Content-Type": "application/json"}) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+                if resp.status == 503 and time.monotonic() < deadline:
+                    _stats["upipe_retries"] += 1
+                    await asyncio.sleep(0.1)
+                    continue
+                log.warning(f"upipe ответил {resp.status}")
+                return False
+        except aiohttp.ClientConnectorError:
+            log.error(f"❌ upipe недоступен: {UPIPE_URL}")
             return False
-    except aiohttp.ClientConnectorError:
-        log.error(f"❌ upipe недоступен: {UPIPE_URL}")
-        return False
-    except Exception as e:
-        log.debug(f"Ошибка пересылки: {e}")
-        return False
+        except Exception as e:
+            log.debug(f"Ошибка пересылки: {e}")
+            return False
 
 
 async def _send_foreign(item: dict):
@@ -119,16 +169,6 @@ def _parse_created_at(created_at_str: str) -> datetime | None:
         return dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
-
-
-def _detect_lang(content: str) -> tuple[str | None, float]:
-    try:
-        res = detect_langs(content)
-    except LangDetectException:
-        return None, 0.0
-    if not res:
-        return None, 0.0
-    return res[0].lang, float(res[0].prob)
 
 
 def _translate_block_reason(lang: str, prob: float, length: int) -> str | None:
@@ -306,7 +346,7 @@ async def _process_item(item) -> str:
         return "skipped_short"
 
     if LANG_FILTER:
-        lang, prob = _detect_lang(content)
+        lang, prob = await _detect_lang_async(content)
         if lang != LANG_FILTER:
             reason = None
             if lang is not None:
@@ -344,7 +384,8 @@ async def _process_item(item) -> str:
             log.info(
                 f"📊 recv={_stats['received']} fwd={_stats['forwarded']} "
                 f"old={_stats['filtered_old']} dup={_stats['filtered_dup']} lang={_stats['filtered_lang']} "
-                f"transl={_stats['to_translate']} foreign={_stats['foreign_sent']} dropped={_stats['dropped']}"
+                f"transl={_stats['to_translate']} foreign={_stats['foreign_sent']} dropped={_stats['dropped']} "
+                f"retries={_stats['upipe_retries']}"
             )
         return "OK"
 
@@ -405,15 +446,16 @@ async def cors_middleware(request: web.Request, handler):
 
 
 async def on_startup(app: web.Application):
-    global _session
+    global _session, _detect_pool
     connector = aiohttp.TCPConnector(limit=20, keepalive_timeout=60)
     _session = aiohttp.ClientSession(connector=connector)
+    _detect_pool = _new_detect_pool()
     if TRANSLATE:
         app["poller"] = asyncio.create_task(_poll_translator())
     log.info(f"🚀 Collector запущен на порту {COLLECTOR_PORT}")
     log.info(f"   Пересылает в upipe: {UPIPE_URL}")
     log.info(f"   Опрос очередей bpipe: {BPIPE_URLS}")
-    log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
+    log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'} (процессов: {DETECT_WORKERS}, первые {DETECT_MAX_CHARS} симв.)")
     log.info(f"   TRANSLATE={TRANSLATE} translator={TRANSLATOR_URL if TRANSLATE else '-'}")
     log.info(f"   Не-{LANG_FILTER} без перевода → {FOREIGN_FORWARD_URL or 'выключено'}")
     log.info(f"   Макс. возраст твита: {MAX_OLDNESS_SECONDS}с ({MAX_OLDNESS_SECONDS/3600:.1f}ч)")
@@ -423,6 +465,8 @@ async def on_shutdown(app: web.Application):
     global _session
     if "poller" in app:
         app["poller"].cancel()
+    if _detect_pool:
+        _detect_pool.shutdown(wait=False, cancel_futures=True)
     if _session:
         await _session.close()
     log.info(f"📊 Итог: {_stats}")
