@@ -28,6 +28,40 @@ services:
       retries: 8
       start_period: 10s
 
+  translator:
+    build:
+      context: ./translator
+    container_name: translator
+    restart: unless-stopped
+    logging: *default-logging
+    cpus: "${TRANSLATOR_CPUS:-4}"
+    depends_on:
+      vpn:
+        condition: service_healthy
+    environment:
+      TRANSLATOR_PORT:           "8003"
+      TRANSLATE:                 "${TRANSLATE:-false}"
+      TRANSLATE_QUEUE_SIZE:      "${TRANSLATE_QUEUE_SIZE:-200}"
+      TRANSLATE_BATCH_SIZE:      "${TRANSLATE_BATCH_SIZE:-8}"
+      TRANSLATE_WORKERS:         "${TRANSLATE_WORKERS:-3}"
+      TRANSLATE_TIMEOUT_SECONDS: "${TRANSLATE_TIMEOUT_SECONDS:-30}"
+      TRANSLATE_MAX_CHARS:       "${TRANSLATE_MAX_CHARS:-2000}"
+      ARGO_LANG_PACKS:           "${ARGO_LANG_PACKS:-es,pt,fr,de,it,ru,ja}"
+      ARGOS_DEVICE_TYPE:         "cpu"
+      OMP_NUM_THREADS:           "${TRANSLATOR_OMP_THREADS:-2}"
+      USE_PROXY:                 "${USE_PROXY_TRANSLATOR:-true}"
+      PROXY_URL:                 "http://vpn:1081"
+    expose:
+      - "8003"
+    volumes:
+      - ./argos_data:/root/.local/share/argos-translate
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "--noproxy", "*", "http://localhost:8003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 90
+      start_period: 120s
+
   transactioneer:
     build:
       context: ./transactioneer
@@ -179,15 +213,21 @@ services:
     depends_on:
       bpipe:
         condition: service_healthy
+      translator:
+        condition: service_healthy
     environment:
-      UPIPE_PORT:               "5981"
-      BPIPE_URLS:               "${BPIPE_URLS:-http://bpipe:7995/}"
-      UPIPE_WORKERS:            "${UPIPE_WORKERS:-2}"
-      UPIPE_QUEUE_LIMIT:        "${UPIPE_QUEUE_LIMIT:-200}"
-      MAX_DEPTH_CLASSIFICATION: "${MAX_DEPTH_CLASSIFICATION:-2}"
-      MAX_MODEL_TOKENS:         "${MAX_MODEL_TOKENS:-400}"
-      USE_PROXY:                "${USE_PROXY_UPIPE:-false}"
-      PROXY_URL:                "http://vpn:1081"
+      UPIPE_PORT:                "5981"
+      BPIPE_URLS:                "${BPIPE_URLS:-http://bpipe:7995/}"
+      UPIPE_WORKERS:             "${UPIPE_WORKERS:-4}"
+      UPIPE_QUEUE_LIMIT:         "${UPIPE_QUEUE_LIMIT:-200}"
+      MAX_DEPTH_CLASSIFICATION:  "${MAX_DEPTH_CLASSIFICATION:-2}"
+      MAX_MODEL_TOKENS:          "${MAX_MODEL_TOKENS:-400}"
+      TRANSLATE:                 "${TRANSLATE:-false}"
+      TRANSLATOR_URL:            "http://translator:8003/"
+      TRANSLATE_TIMEOUT_SECONDS: "${TRANSLATE_TIMEOUT_SECONDS:-30}"
+      FOREIGN_FORWARD_URL:       "${FOREIGN_FORWARD_URL-http://192.168.0.100:9000/store_item}"
+      USE_PROXY:                 "${USE_PROXY_UPIPE:-false}"
+      PROXY_URL:                 "http://vpn:1081"
     expose:
       - "5981"
     volumes:
@@ -212,6 +252,12 @@ services:
       COLLECTOR_PORT:      "9000"
       UPIPE_URL:           "http://upipe:5981/"
       BPIPE_URLS:          "${BPIPE_URLS:-http://bpipe:7995/}"
+      TRANSACTIONEER_URL:  "http://transactioneer:8002/"
+      TRANSLATOR_URL:      "http://translator:8003/"
+      TRANSLATE:           "${TRANSLATE:-false}"
+      TRANSLATE_MAX_CHARS: "${TRANSLATE_MAX_CHARS:-2000}"
+      TRANSLATE_BUSY_FILL: "${TRANSLATE_BUSY_FILL:-0.9}"
+      LANG_CONFIDENCE_THRESHOLD: "${LANG_CONFIDENCE_THRESHOLD:-0.90}"
       UPIPE_QUEUE_LIMIT:   "${UPIPE_QUEUE_LIMIT:-200}"
       QUEUE_LOW_FILL:      "${QUEUE_LOW_FILL:-0.2}"
       QUEUE_HIGH_FILL:     "${QUEUE_HIGH_FILL:-0.7}"

@@ -6,11 +6,12 @@ from zero_shot import zero_shot
 from evaluate_token_count import evaluate_token_count, MAX_MODEL_TOKENS
 from exorde_data import Translation, Classification, Keywords, Processed, Item, Translated
 
-def process(item: Item, lab_configuration, max_depth_classification) -> Processed:
+def process(item: Item, lab_configuration, max_depth_classification, translation: Translation | None = None) -> Processed:
     t0 = time.perf_counter()
     try:
         item = preprocess(item, False)
-        translation: Translation = translate(item, lab_configuration["installed_languages"])
+        if translation is None:
+            translation = translate(item, lab_configuration["installed_languages"])
         if translation.translation == "":
             raise ValueError("No content to work with")
 

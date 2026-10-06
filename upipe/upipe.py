@@ -1,6 +1,5 @@
 import asyncio
 import itertools
-import json
 import logging
 import os
 import sys
@@ -12,10 +11,16 @@ from aiohttp import web
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from exorde_data import Item, CreatedAt, Content, Domain, Url, Title, ExternalId, Author, ExternalParentId
+from exorde_data import (
+    Item, CreatedAt, Content, Domain, Url, Title, ExternalId, Author, ExternalParentId,
+    Translation, Language, Translated,
+)
 from process import process
 from translate import NonEnglishError
 from lab_initialization import lab_initialization
+from translator_client import (
+    translate_remote, TranslatorBusy, TranslatorUnavailable, TranslatorRejected,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +33,11 @@ UPIPE_PORT   = int(os.getenv("UPIPE_PORT", "5981"))
 WORKERS      = int(os.getenv("UPIPE_WORKERS", "4"))
 QUEUE_LIMIT  = int(os.getenv("UPIPE_QUEUE_LIMIT", "200"))
 MAX_DEPTH_CLASSIFICATION = int(os.getenv("MAX_DEPTH_CLASSIFICATION", "2"))
+
+TRANSLATE           = os.getenv("TRANSLATE", "false").lower() == "true"
+TRANSLATOR_URL      = os.getenv("TRANSLATOR_URL", "http://translator:8003/")
+TRANSLATE_TIMEOUT   = float(os.getenv("TRANSLATE_TIMEOUT_SECONDS", "30"))
+FOREIGN_FORWARD_URL = os.getenv("FOREIGN_FORWARD_URL", "").strip()
 
 def _parse_bpipe_urls() -> list[str]:
     urls_env = os.getenv("BPIPE_URLS", "")
@@ -45,12 +55,17 @@ _thread_pool: ThreadPoolExecutor | None = None
 
 _bpipe_cycle: itertools.cycle | None = None
 _bpipe_lock = asyncio.Lock()
+_bg_tasks: set = set()
 
-_stats = {"received": 0, "processed": 0, "forwarded": 0, "errors": 0, "dropped": 0, "filtered_lang": 0}
+_stats = {
+    "received": 0, "processed": 0, "forwarded": 0, "errors": 0, "dropped": 0, "filtered_lang": 0,
+    "translated": 0, "translate_fallback": 0, "translate_errors": 0, "translate_identical": 0,
+    "foreign_sent": 0,
+}
 
 
-def _process_sync(item: Item, lab_config: dict) -> dict:
-    processed = process(item, lab_config, MAX_DEPTH_CLASSIFICATION)
+def _process_sync(item: Item, lab_config: dict, translation: Translation | None = None) -> dict:
+    processed = process(item, lab_config, MAX_DEPTH_CLASSIFICATION, translation)
     return {
         "item": {
             "created_at":         str(processed.item.get("created_at", "")),
@@ -102,6 +117,54 @@ async def forward_to_bpipe(payload: dict) -> bool:
         return False
 
 
+async def _send_foreign(payload: dict):
+    try:
+        async with _session.post(
+            FOREIGN_FORWARD_URL,
+            data=orjson.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            await resp.read()
+    except Exception as e:
+        log.debug(f"foreign forward error: {e}")
+
+
+def _forward_foreign(raw_item: dict):
+    if not FOREIGN_FORWARD_URL or _session is None:
+        return
+    payload = {k: v for k, v in raw_item.items() if k not in ("detected_lang", "foreign_author")}
+    payload["author"] = raw_item.get("foreign_author", raw_item.get("author", ""))
+    _stats["foreign_sent"] += 1
+    task = asyncio.create_task(_send_foreign(payload))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def _translate_or_fallback(item: Item, raw_item: dict, lang: str) -> Translation | None:
+    text = str(item.get("content", ""))
+    try:
+        out = await translate_remote(_session, TRANSLATOR_URL, text, lang, TRANSLATE_TIMEOUT)
+    except TranslatorBusy:
+        _stats["translate_fallback"] += 1
+        _forward_foreign(raw_item)
+        return None
+    except (TranslatorUnavailable, TranslatorRejected) as e:
+        _stats["translate_errors"] += 1
+        _stats["translate_fallback"] += 1
+        if _stats["translate_errors"] % 20 == 1:
+            log.error(f"❌ translator: {e} (ошибок всего: {_stats['translate_errors']})")
+        _forward_foreign(raw_item)
+        return None
+
+    if out.strip() == text.strip():
+        _stats["translate_identical"] += 1
+        return None
+
+    _stats["translated"] += 1
+    return Translation(language=Language(lang.split("-")[0]), translation=Translated(out))
+
+
 async def worker_loop(worker_id: int):
     global _stats
     log.info(f"👷 Upipe-воркер #{worker_id} запущен")
@@ -112,11 +175,19 @@ async def worker_loop(worker_id: int):
             item, raw_item = await _process_queue.get()
 
             try:
+                translation = None
+                lang = (raw_item.get("detected_lang") or "").lower()
+                if TRANSLATE and lang and lang != "en":
+                    translation = await _translate_or_fallback(item, raw_item, lang)
+                    if translation is None:
+                        continue
+
                 payload = await loop.run_in_executor(
                     _thread_pool,
                     _process_sync,
                     item,
                     _lab_config,
+                    translation,
                 )
                 _stats["processed"] += 1
 
@@ -149,7 +220,8 @@ async def worker_loop(worker_id: int):
                 log.info(
                     f"📊 recv={_stats['received']} proc={_stats['processed']} "
                     f"fwd={_stats['forwarded']} err={_stats['errors']} "
-                    f"lang={_stats['filtered_lang']} dropped={_stats['dropped']}"
+                    f"lang={_stats['filtered_lang']} dropped={_stats['dropped']} "
+                    f"transl={_stats['translated']} tr_fallback={_stats['translate_fallback']}"
                 )
 
         except Exception as e:
@@ -200,6 +272,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "status": "ok",
         "queue":  _process_queue.qsize() if _process_queue else 0,
         "bpipe_urls": BPIPE_URLS,
+        "translate": {"enabled": TRANSLATE, "url": TRANSLATOR_URL if TRANSLATE else None},
         "stats":  _stats,
     })
 
@@ -209,6 +282,7 @@ async def on_startup(app: web.Application):
 
     log.info("🔬 Инициализация upipe...")
     log.info(f"   bpipe инстансов: {len(BPIPE_URLS)} → {BPIPE_URLS}")
+    log.info(f"   TRANSLATE={TRANSLATE} translator={TRANSLATOR_URL if TRANSLATE else '-'}")
 
     loop = asyncio.get_event_loop()
     _thread_pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="upipe_worker")
@@ -217,7 +291,7 @@ async def on_startup(app: web.Application):
     _process_queue = asyncio.Queue()
     _bpipe_cycle   = itertools.cycle(BPIPE_URLS)
 
-    connector = aiohttp.TCPConnector(limit=20, keepalive_timeout=60)
+    connector = aiohttp.TCPConnector(limit=40, keepalive_timeout=60)
     _session = aiohttp.ClientSession(connector=connector)
 
     for i in range(WORKERS):
