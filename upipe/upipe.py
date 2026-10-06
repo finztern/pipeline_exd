@@ -1,9 +1,11 @@
 import asyncio
 import itertools
 import logging
+import multiprocessing as mp
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 
 import aiohttp
 import orjson
@@ -49,9 +51,8 @@ def _parse_bpipe_urls() -> list[str]:
 BPIPE_URLS: list[str] = _parse_bpipe_urls()
 
 _session: aiohttp.ClientSession | None = None
-_lab_config: dict | None = None
 _process_queue: asyncio.Queue | None = None
-_thread_pool: ThreadPoolExecutor | None = None
+_proc_pool: ProcessPoolExecutor | None = None
 
 _bpipe_cycle: itertools.cycle | None = None
 _bpipe_lock = asyncio.Lock()
@@ -60,12 +61,29 @@ _bg_tasks: set = set()
 _stats = {
     "received": 0, "processed": 0, "forwarded": 0, "errors": 0, "dropped": 0, "filtered_lang": 0,
     "translated": 0, "translate_fallback": 0, "translate_errors": 0, "translate_identical": 0,
-    "foreign_sent": 0,
+    "foreign_sent": 0, "pool_restarts": 0,
 }
 
+_worker_lab: dict | None = None
 
-def _process_sync(item: Item, lab_config: dict, translation: Translation | None = None) -> dict:
-    processed = process(item, lab_config, MAX_DEPTH_CLASSIFICATION, translation)
+
+def _init_worker():
+    global _worker_lab
+    logging.getLogger().setLevel(logging.WARNING)
+    _worker_lab = lab_initialization()
+
+
+def _new_pool() -> ProcessPoolExecutor:
+    # CPU-bound (langdetect/yake/tiktoken) держит GIL — потоки не параллелятся, нужны процессы
+    return ProcessPoolExecutor(
+        max_workers=WORKERS,
+        mp_context=mp.get_context("spawn"),
+        initializer=_init_worker,
+    )
+
+
+def _process_sync(item: Item, translation: Translation | None = None) -> dict:
+    processed = process(item, _worker_lab, MAX_DEPTH_CLASSIFICATION, translation)
     return {
         "item": {
             "created_at":         str(processed.item.get("created_at", "")),
@@ -113,7 +131,7 @@ async def forward_to_bpipe(payload: dict) -> bool:
         log.error(f"❌ bpipe недоступен: {url}")
         return False
     except Exception as e:
-        log.debug(f"Ошибка отправки в bpipe: {e}")
+        log.warning(f"Ошибка отправки в bpipe {url}: {type(e).__name__}: {e}")
         return False
 
 
@@ -166,7 +184,7 @@ async def _translate_or_fallback(item: Item, raw_item: dict, lang: str) -> Trans
 
 
 async def worker_loop(worker_id: int):
-    global _stats
+    global _stats, _proc_pool
     log.info(f"👷 Upipe-воркер #{worker_id} запущен")
 
     loop = asyncio.get_event_loop()
@@ -182,13 +200,8 @@ async def worker_loop(worker_id: int):
                     if translation is None:
                         continue
 
-                payload = await loop.run_in_executor(
-                    _thread_pool,
-                    _process_sync,
-                    item,
-                    _lab_config,
-                    translation,
-                )
+                pool = _proc_pool
+                payload = await loop.run_in_executor(pool, _process_sync, item, translation)
                 _stats["processed"] += 1
 
                 if raw_item.get("username"):
@@ -199,15 +212,20 @@ async def worker_loop(worker_id: int):
                 ok = await forward_to_bpipe(payload)
                 if ok:
                     _stats["forwarded"] += 1
-                    log.debug(
-                        f"✅ [{worker_id}] → bpipe | {raw_item.get('url', '')[:60]}"
-                    )
                 else:
                     _stats["errors"] += 1
 
             except NonEnglishError as e:
                 _stats["filtered_lang"] += 1
                 log.debug(f"🌐 [{worker_id}] Не-английский текст отброшен: {e}")
+
+            except BrokenProcessPool:
+                _stats["errors"] += 1
+                if pool is _proc_pool:
+                    log.error("❌ ProcessPool сломан — пересоздаю")
+                    _stats["pool_restarts"] += 1
+                    _proc_pool = _new_pool()
+                    pool.shutdown(wait=False)
 
             except Exception as e:
                 _stats["errors"] += 1
@@ -278,16 +296,13 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def on_startup(app: web.Application):
-    global _session, _lab_config, _process_queue, _thread_pool, _bpipe_cycle
+    global _session, _process_queue, _proc_pool, _bpipe_cycle
 
     log.info("🔬 Инициализация upipe...")
     log.info(f"   bpipe инстансов: {len(BPIPE_URLS)} → {BPIPE_URLS}")
     log.info(f"   TRANSLATE={TRANSLATE} translator={TRANSLATOR_URL if TRANSLATE else '-'}")
 
-    loop = asyncio.get_event_loop()
-    _thread_pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="upipe_worker")
-    _lab_config = await loop.run_in_executor(None, lab_initialization)
-
+    _proc_pool = _new_pool()
     _process_queue = asyncio.Queue()
     _bpipe_cycle   = itertools.cycle(BPIPE_URLS)
 
@@ -297,16 +312,16 @@ async def on_startup(app: web.Application):
     for i in range(WORKERS):
         asyncio.create_task(worker_loop(i))
 
-    log.info(f"✅ Upipe запущен на порту {UPIPE_PORT} ({WORKERS} воркеров)")
+    log.info(f"✅ Upipe запущен на порту {UPIPE_PORT} ({WORKERS} воркеров, процессы)")
     log.info(f"   Round-robin → {BPIPE_URLS}")
 
 
 async def on_shutdown(app: web.Application):
-    global _session, _thread_pool
+    global _session, _proc_pool
     if _session:
         await _session.close()
-    if _thread_pool:
-        _thread_pool.shutdown(wait=False)
+    if _proc_pool:
+        _proc_pool.shutdown(wait=False, cancel_futures=True)
     log.info(f"📊 Итог upipe: {_stats}")
 
 
