@@ -57,6 +57,8 @@ _proc_pool: ProcessPoolExecutor | None = None
 _bpipe_cycle: itertools.cycle | None = None
 _bpipe_lock = asyncio.Lock()
 _bg_tasks: set = set()
+TRANSLATE_CONCURRENCY = int(os.getenv("UPIPE_TRANSLATE_CONCURRENCY", "16"))
+_translate_pending = 0
 
 _stats = {
     "received": 0, "processed": 0, "forwarded": 0, "errors": 0, "dropped": 0, "filtered_lang": 0,
@@ -183,6 +185,31 @@ async def _translate_or_fallback(item: Item, raw_item: dict, lang: str) -> Trans
     return Translation(language=Language(lang.split("-")[0]), translation=Translated(out))
 
 
+async def _translate_task(item: Item, raw_item: dict, lang: str):
+    global _translate_pending
+    try:
+        translation = await _translate_or_fallback(item, raw_item, lang)
+        if translation is not None:
+            await _process_queue.put((item, raw_item, translation))
+    except Exception as e:
+        _stats["errors"] += 1
+        log.warning(f"⚠️ translate task: {type(e).__name__}: {e}")
+    finally:
+        _translate_pending -= 1
+
+
+def _dispatch_translation(item: Item, raw_item: dict, lang: str):
+    global _translate_pending
+    if _translate_pending >= TRANSLATE_CONCURRENCY:
+        _stats["translate_fallback"] += 1
+        _forward_foreign(raw_item)
+        return
+    _translate_pending += 1
+    task = asyncio.create_task(_translate_task(item, raw_item, lang))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
 async def worker_loop(worker_id: int):
     global _stats, _proc_pool
     log.info(f"👷 Upipe-воркер #{worker_id} запущен")
@@ -190,15 +217,15 @@ async def worker_loop(worker_id: int):
     loop = asyncio.get_event_loop()
     while True:
         try:
-            item, raw_item = await _process_queue.get()
+            entry = await _process_queue.get()
+            item, raw_item = entry[0], entry[1]
+            translation = entry[2] if len(entry) > 2 else None
 
             try:
-                translation = None
                 lang = (raw_item.get("detected_lang") or "").lower()
-                if TRANSLATE and lang and lang != "en":
-                    translation = await _translate_or_fallback(item, raw_item, lang)
-                    if translation is None:
-                        continue
+                if translation is None and TRANSLATE and lang and lang != "en":
+                    _dispatch_translation(item, raw_item, lang)
+                    continue
 
                 pool = _proc_pool
                 payload = await loop.run_in_executor(pool, _process_sync, item, translation)
@@ -290,7 +317,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "status": "ok",
         "queue":  _process_queue.qsize() if _process_queue else 0,
         "bpipe_urls": BPIPE_URLS,
-        "translate": {"enabled": TRANSLATE, "url": TRANSLATOR_URL if TRANSLATE else None},
+        "translate": {"enabled": TRANSLATE, "url": TRANSLATOR_URL if TRANSLATE else None, "pending": _translate_pending, "concurrency": TRANSLATE_CONCURRENCY},
         "stats":  _stats,
     })
 
