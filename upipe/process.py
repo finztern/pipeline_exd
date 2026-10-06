@@ -11,6 +11,10 @@ def process(item: Item, lab_configuration, max_depth_classification, translation
     try:
         item = preprocess(item, False)
         if translation is None:
+            # без перевода translation == content, поэтому длинные item отсекаем до дорогого langdetect
+            n_raw = evaluate_token_count(str(item.content))
+            if n_raw > MAX_MODEL_TOKENS:
+                raise ValueError(f"Токен-лимит превышен ({n_raw} > {MAX_MODEL_TOKENS}), item отброшен")
             translation = translate(item, lab_configuration["installed_languages"])
         if translation.translation == "":
             raise ValueError("No content to work with")
