@@ -11,6 +11,13 @@ import aiohttp
 import ctranslate2
 from aiohttp import web
 from transformers import AutoTokenizer
+from transformers.models.m2m_100 import modeling_m2m_100 as _m2m
+
+# ctranslate2 4.4.0 читает encoder/decoder.embed_scale, а в новых transformers он лежит в embed_tokens
+if hasattr(_m2m, "M2M100ScaledWordEmbedding"):
+    for _cls in (_m2m.M2M100Encoder, _m2m.M2M100Decoder):
+        if not hasattr(_cls, "embed_scale"):
+            _cls.embed_scale = property(lambda self: self.embed_tokens.embed_scale)
 
 logging.basicConfig(
     level=logging.INFO,
