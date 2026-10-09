@@ -1,0 +1,28 @@
+services:
+  translator_gpu:
+    build: .
+    container_name: translator_gpu
+    restart: unless-stopped
+    environment:
+      GPU_TRANSLATOR_PORT: "8004"
+      UPIPE_URL:           "${UPIPE_URL}"
+      OPUS_MODELS:         "${OPUS_MODELS:-de:Helsinki-NLP/opus-mt-de-en,fr:Helsinki-NLP/opus-mt-fr-en,es:Helsinki-NLP/opus-mt-es-en,it:Helsinki-NLP/opus-mt-it-en,pt:Helsinki-NLP/opus-mt-ROMANCE-en}"
+      NLLB_MODEL:          "${NLLB_MODEL:-facebook/nllb-200-distilled-600M}"
+      GPU_COMPUTE_TYPE:    "${GPU_COMPUTE_TYPE:-int8}"
+      GPU_BATCH_SIZE:      "${GPU_BATCH_SIZE:-16}"
+      GPU_BEAM_SIZE:       "${GPU_BEAM_SIZE:-2}"
+      GPU_QUEUE_SIZE:      "${GPU_QUEUE_SIZE:-2000}"
+      HTTP_PROXY:          "${HF_PROXY:-}"
+      HTTPS_PROXY:         "${HF_PROXY:-}"
+    ports:
+      - "8004:8004"
+    volumes:
+      - ./models_cache:/root/.cache
+      - ./ct2_models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

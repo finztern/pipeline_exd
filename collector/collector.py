@@ -1,13 +1,10 @@
 import asyncio
 import hashlib
 import logging
-import multiprocessing as mp
 import os
 import sys
 import time
 from collections import Counter, OrderedDict
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
@@ -35,7 +32,7 @@ BPIPE_URLS          = [u.strip() for u in os.getenv("BPIPE_URLS", "http://bpipe:
 UPIPE_QUEUE_LIMIT   = int(os.getenv("UPIPE_QUEUE_LIMIT", "200"))
 QUEUE_LOW_FILL      = float(os.getenv("QUEUE_LOW_FILL", "0.2"))
 QUEUE_HIGH_FILL     = float(os.getenv("QUEUE_HIGH_FILL", "0.7"))
-FOREIGN_FORWARD_URL = os.getenv("FOREIGN_FORWARD_URL", "http://192.168.0.101:9000/store_item").strip()
+FOREIGN_FORWARD_URL = os.getenv("FOREIGN_FORWARD_URL", "").strip()
 
 TRANSLATE             = os.getenv("TRANSLATE", "false").lower() == "true"
 TRANSLATOR_URL        = os.getenv("TRANSLATOR_URL", "http://translator:8003/")
@@ -45,9 +42,9 @@ TRANSLATE_BUSY_FILL   = float(os.getenv("TRANSLATE_BUSY_FILL", "0.9"))
 TRANSLATE_POLL_SEC    = float(os.getenv("TRANSLATE_POLL_SECONDS", "1.0"))
 LANG_CONFIDENCE       = float(os.getenv("LANG_CONFIDENCE_THRESHOLD", "0.90"))
 
-DETECT_WORKERS        = int(os.getenv("DETECT_WORKERS", "3"))
-DETECT_MAX_CHARS      = int(os.getenv("DETECT_MAX_CHARS", "1000"))
-UPIPE_RETRY_SECONDS   = float(os.getenv("UPIPE_RETRY_SECONDS", "3.0"))
+GPU_TRANSLATOR_URL  = os.getenv("GPU_TRANSLATOR_URL", "").strip()
+GPU_ROUTE_REASONS   = {r.strip() for r in os.getenv("GPU_ROUTE_REASONS", "queue_full").split(",") if r.strip()}
+GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "30"))
 
 LANG_ALIASES = {"zh-cn": "zh", "zh-tw": "zt", "no": "nb"}
 
@@ -58,14 +55,14 @@ _started = time.time()
 _stats = {
     "received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0,
     "foreign_sent": 0, "to_translate": 0, "truncated": 0, "errors": 0, "dropped": 0,
-    "upipe_retries": 0,
+    "to_gpu": 0, "gpu_failed": 0,
 }
 _langs_seen: Counter = Counter()
 _foreign_reasons: Counter = Counter()
 _tr_state = {"ok": False, "fill": 1.0, "installed": frozenset()}
 _session: aiohttp.ClientSession | None = None
 _bg_tasks: set = set()
-_detect_pool: ProcessPoolExecutor | None = None
+_gpu_down_until = 0.0
 
 
 def _norm_lang(lang: str) -> str:
@@ -78,64 +75,23 @@ def _hash_author(author: str) -> str:
     return hashlib.sha1(author.encode("utf-8")).hexdigest()
 
 
-def _detect_lang(content: str) -> tuple[str | None, float]:
-    try:
-        res = detect_langs(content)
-    except LangDetectException:
-        return None, 0.0
-    if not res:
-        return None, 0.0
-    return res[0].lang, float(res[0].prob)
-
-
-def _new_detect_pool() -> ProcessPoolExecutor:
-    # langdetect — чистый Python под GIL; в event loop он упирался в 1 ядро
-    return ProcessPoolExecutor(
-        max_workers=DETECT_WORKERS,
-        mp_context=mp.get_context("spawn"),
-        initializer=_detect_lang,
-        initargs=("warm up the language detector profiles",),
-    )
-
-
-async def _detect_lang_async(content: str) -> tuple[str | None, float]:
-    global _detect_pool
-    text = content[:DETECT_MAX_CHARS]
-    pool = _detect_pool
-    try:
-        return await asyncio.get_running_loop().run_in_executor(pool, _detect_lang, text)
-    except BrokenProcessPool:
-        if pool is _detect_pool:
-            log.error("❌ detect pool сломан — пересоздаю")
-            _detect_pool = _new_detect_pool()
-            pool.shutdown(wait=False)
-        return _detect_lang(text)
-
-
 async def forward_to_upipe(item: dict) -> bool:
     global _session
     if _session is None:
         return False
-    data = orjson.dumps(item)
-    deadline = time.monotonic() + UPIPE_RETRY_SECONDS
-    while True:
-        try:
-            async with _session.post(UPIPE_URL, data=data,
-                                      headers={"Content-Type": "application/json"}) as resp:
-                if 200 <= resp.status < 300:
-                    return True
-                if resp.status == 503 and time.monotonic() < deadline:
-                    _stats["upipe_retries"] += 1
-                    await asyncio.sleep(0.1)
-                    continue
-                log.warning(f"upipe ответил {resp.status}")
-                return False
-        except aiohttp.ClientConnectorError:
-            log.error(f"❌ upipe недоступен: {UPIPE_URL}")
+    try:
+        async with _session.post(UPIPE_URL, data=orjson.dumps(item),
+                                  headers={"Content-Type": "application/json"}) as resp:
+            if 200 <= resp.status < 300:
+                return True
+            log.warning(f"upipe ответил {resp.status}")
             return False
-        except Exception as e:
-            log.debug(f"Ошибка пересылки: {e}")
-            return False
+    except aiohttp.ClientConnectorError:
+        log.error(f"❌ upipe недоступен: {UPIPE_URL}")
+        return False
+    except Exception as e:
+        log.debug(f"Ошибка пересылки: {e}")
+        return False
 
 
 async def _send_foreign(item: dict):
@@ -157,6 +113,35 @@ def _forward_foreign(item: dict):
     task.add_done_callback(_bg_tasks.discard)
 
 
+def _gpu_route_ok(reason: str | None) -> bool:
+    return bool(GPU_TRANSLATOR_URL) and reason in GPU_ROUTE_REASONS and time.monotonic() >= _gpu_down_until
+
+
+async def _send_gpu(item: dict, raw_item: dict):
+    global _gpu_down_until
+    try:
+        async with _session.post(GPU_TRANSLATOR_URL, data=orjson.dumps(item),
+                                  headers={"Content-Type": "application/json"},
+                                  timeout=aiohttp.ClientTimeout(total=3)) as resp:
+            await resp.read()
+            if resp.status == 202:
+                return
+            if resp.status != 422:
+                _gpu_down_until = time.monotonic() + GPU_RETRY_SECONDS
+    except Exception:
+        _gpu_down_until = time.monotonic() + GPU_RETRY_SECONDS
+    _stats["gpu_failed"] += 1
+    _stats["to_gpu"] -= 1
+    _forward_foreign(raw_item)
+
+
+def _forward_gpu(item: dict, raw_item: dict):
+    _stats["to_gpu"] += 1
+    task = asyncio.create_task(_send_gpu(item, raw_item))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
 def _parse_created_at(created_at_str: str) -> datetime | None:
     if not created_at_str:
         return None
@@ -169,6 +154,16 @@ def _parse_created_at(created_at_str: str) -> datetime | None:
         return dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
+
+
+def _detect_lang(content: str) -> tuple[str | None, float]:
+    try:
+        res = detect_langs(content)
+    except LangDetectException:
+        return None, 0.0
+    if not res:
+        return None, 0.0
+    return res[0].lang, float(res[0].prob)
 
 
 def _translate_block_reason(lang: str, prob: float, length: int) -> str | None:
@@ -307,6 +302,8 @@ async def handle_stats(request: web.Request) -> web.Response:
             "upipe_errors": up_stats.get("translate_errors", 0),
             "identical_dropped": up_stats.get("translate_identical", 0),
             "foreign_reasons": dict(_foreign_reasons),
+            "gpu_sent_collector": _stats["to_gpu"],
+            "gpu_sent_upipe": up_stats.get("gpu_sent", 0),
         },
         "languages": {
             "seen_count": len(_langs_seen),
@@ -345,8 +342,9 @@ async def _process_item(item) -> str:
     if len(content) < MIN_TEXT_LEN:
         return "skipped_short"
 
+    gpu_route = False
     if LANG_FILTER:
-        lang, prob = await _detect_lang_async(content)
+        lang, prob = _detect_lang(content)
         if lang != LANG_FILTER:
             reason = None
             if lang is not None:
@@ -356,6 +354,9 @@ async def _process_item(item) -> str:
                 item["detected_lang"] = lang
                 item["foreign_author"] = raw_item.get("author", "")
                 _stats["to_translate"] += 1
+            elif lang is not None and _gpu_route_ok(reason):
+                item["detected_lang"] = lang
+                gpu_route = True
             else:
                 _stats["filtered_lang"] += 1
                 if lang is not None:
@@ -378,14 +379,17 @@ async def _process_item(item) -> str:
     else:
         log.warning(f"⚠️ Не удалось распарсить created_at: {created_at_str!r}")
 
+    if gpu_route:
+        _forward_gpu(item, raw_item)
+        return "to_gpu"
+
     if await forward_to_upipe(item):
         _stats["forwarded"] += 1
         if _stats["forwarded"] % 50 == 0:
             log.info(
                 f"📊 recv={_stats['received']} fwd={_stats['forwarded']} "
                 f"old={_stats['filtered_old']} dup={_stats['filtered_dup']} lang={_stats['filtered_lang']} "
-                f"transl={_stats['to_translate']} foreign={_stats['foreign_sent']} dropped={_stats['dropped']} "
-                f"retries={_stats['upipe_retries']}"
+                f"transl={_stats['to_translate']} gpu={_stats['to_gpu']} foreign={_stats['foreign_sent']} dropped={_stats['dropped']}"
             )
         return "OK"
 
@@ -434,6 +438,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "upipe": UPIPE_URL,
         "lang_filter": LANG_FILTER or None,
         "translate": TRANSLATE,
+        "gpu_translator": GPU_TRANSLATOR_URL or None,
         "foreign_forward_url": FOREIGN_FORWARD_URL or None,
     })
 
@@ -446,17 +451,17 @@ async def cors_middleware(request: web.Request, handler):
 
 
 async def on_startup(app: web.Application):
-    global _session, _detect_pool
+    global _session
     connector = aiohttp.TCPConnector(limit=20, keepalive_timeout=60)
     _session = aiohttp.ClientSession(connector=connector)
-    _detect_pool = _new_detect_pool()
     if TRANSLATE:
         app["poller"] = asyncio.create_task(_poll_translator())
     log.info(f"🚀 Collector запущен на порту {COLLECTOR_PORT}")
     log.info(f"   Пересылает в upipe: {UPIPE_URL}")
     log.info(f"   Опрос очередей bpipe: {BPIPE_URLS}")
-    log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'} (процессов: {DETECT_WORKERS}, первые {DETECT_MAX_CHARS} симв.)")
+    log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
     log.info(f"   TRANSLATE={TRANSLATE} translator={TRANSLATOR_URL if TRANSLATE else '-'}")
+    log.info(f"   GPU translator: {GPU_TRANSLATOR_URL or 'выключен'} (причины: {sorted(GPU_ROUTE_REASONS)})")
     log.info(f"   Не-{LANG_FILTER} без перевода → {FOREIGN_FORWARD_URL or 'выключено'}")
     log.info(f"   Макс. возраст твита: {MAX_OLDNESS_SECONDS}с ({MAX_OLDNESS_SECONDS/3600:.1f}ч)")
 
@@ -465,8 +470,6 @@ async def on_shutdown(app: web.Application):
     global _session
     if "poller" in app:
         app["poller"].cancel()
-    if _detect_pool:
-        _detect_pool.shutdown(wait=False, cancel_futures=True)
     if _session:
         await _session.close()
     log.info(f"📊 Итог: {_stats}")

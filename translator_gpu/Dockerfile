@@ -1,0 +1,27 @@
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3 /usr/bin/python
+
+WORKDIR /app
+
+RUN pip3 install --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --extra-index-url https://pypi.org/simple \
+    torch==2.5.1 \
+    "numpy<2" \
+    "transformers==4.46.3" \
+    sentencepiece sacremoses \
+    "ctranslate2==4.4.0" \
+    "aiohttp>=3.9.0"
+
+COPY translator_gpu.py .
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=120 --start-period=120s \
+    CMD curl -sf http://localhost:8004/health || exit 1
+
+CMD ["python", "translator_gpu.py"]

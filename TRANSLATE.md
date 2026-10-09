@@ -77,3 +77,9 @@ docker compose exec translator curl -s --noproxy '*' -X POST localhost:8003/tran
 docker compose logs upipe | grep transl=
 ```
 - `test_pipeline.sh::test_non_english` ожидает `filtered_lang` — валиден только при `TRANSLATE=false`.
+
+## GPU-переводчик на втором ПК (опционально)
+- Папка `translator_gpu/` запускается на втором ПК: `cd translator_gpu && cp .env.example .env && docker compose up -d --build`.
+- В `.env` второго ПК: `UPIPE_URL=http://<IP основного>:5981/`. В `.env` основного: `GPU_TRANSLATOR_URL=http://<IP второго>:8004/`.
+- Item уходит на GPU при `queue_full` (список причин: `GPU_ROUTE_REASONS`); de/fr/es/it/pt → Opus-MT, остальное → NLLB-600M; результат возвращается в upipe с полем `pretranslated`.
+- Второй ПК недоступен → `GPU_RETRY_SECONDS` (30с) item не отправляются туда, уходят на `FOREIGN_FORWARD_URL` (если задан) или отбрасываются.

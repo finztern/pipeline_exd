@@ -103,7 +103,6 @@ services:
       FIXED_BATCH_SIZE:        "${FIXED_BATCH_SIZE:-6}"
       BATCH_TIMEOUT_SECONDS:   "${BATCH_TIMEOUT_SECONDS:-3.0}"
       MAX_QUEUE_SIZE:          "${MAX_QUEUE_SIZE:-100}"
-      BPIPE_MAX_AGE_SECONDS:   "${BPIPE_MAX_AGE_SECONDS:-300}"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       CUDA_LAUNCH_BLOCKING:    "0"
       MAIN_ADDRESS:            "${MAIN_ADDRESS}"
@@ -143,7 +142,6 @@ services:
       FIXED_BATCH_SIZE:        "${FIXED_BATCH_SIZE:-6}"
       BATCH_TIMEOUT_SECONDS:   "${BATCH_TIMEOUT_SECONDS:-3.0}"
       MAX_QUEUE_SIZE:          "${MAX_QUEUE_SIZE:-100}"
-      BPIPE_MAX_AGE_SECONDS:   "${BPIPE_MAX_AGE_SECONDS:-300}"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       CUDA_LAUNCH_BLOCKING:    "0"
       MAIN_ADDRESS:            "${MAIN_ADDRESS}"
@@ -183,7 +181,6 @@ services:
       FIXED_BATCH_SIZE:        "${FIXED_BATCH_SIZE:-6}"
       BATCH_TIMEOUT_SECONDS:   "${BATCH_TIMEOUT_SECONDS:-3.0}"
       MAX_QUEUE_SIZE:          "${MAX_QUEUE_SIZE:-100}"
-      BPIPE_MAX_AGE_SECONDS:   "${BPIPE_MAX_AGE_SECONDS:-300}"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       CUDA_LAUNCH_BLOCKING:    "0"
       MAIN_ADDRESS:            "${MAIN_ADDRESS}"
@@ -228,11 +225,13 @@ services:
       TRANSLATE:                 "${TRANSLATE:-false}"
       TRANSLATOR_URL:            "http://translator:8003/"
       TRANSLATE_TIMEOUT_SECONDS: "${TRANSLATE_TIMEOUT_SECONDS:-30}"
-      FOREIGN_FORWARD_URL:       "${FOREIGN_FORWARD_URL-http://192.168.0.100:9000/store_item}"
+      FOREIGN_FORWARD_URL:       "${FOREIGN_FORWARD_URL:-}"
+      GPU_TRANSLATOR_URL:        "${GPU_TRANSLATOR_URL:-}"
+      GPU_RETRY_SECONDS:         "${GPU_RETRY_SECONDS:-30}"
       USE_PROXY:                 "${USE_PROXY_UPIPE:-false}"
       PROXY_URL:                 "http://vpn:1081"
-    expose:
-      - "5981"
+    ports:
+      - "5981:5981"
     volumes:
       - ./models_cache:/root/.cache
     healthcheck:
@@ -268,7 +267,10 @@ services:
       MIN_TEXT_LEN:        "${MIN_TEXT_LEN:-20}"
       MAX_TEXT_LEN:        "${MAX_TEXT_LEN:-20000}"
       MAX_OLDNESS_SECONDS: "${MAX_OLDNESS_SECONDS:-86400}"
-      FOREIGN_FORWARD_URL: "${FOREIGN_FORWARD_URL-http://192.168.0.100:9000/store_item}"
+      FOREIGN_FORWARD_URL: "${FOREIGN_FORWARD_URL:-}"
+      GPU_TRANSLATOR_URL:  "${GPU_TRANSLATOR_URL:-}"
+      GPU_ROUTE_REASONS:   "${GPU_ROUTE_REASONS:-queue_full}"
+      GPU_RETRY_SECONDS:   "${GPU_RETRY_SECONDS:-30}"
     ports:
       - "9000:9000"
     healthcheck:

@@ -1,11 +1,10 @@
 import asyncio
 import itertools
 import logging
-import multiprocessing as mp
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 import orjson
@@ -40,6 +39,8 @@ TRANSLATE           = os.getenv("TRANSLATE", "false").lower() == "true"
 TRANSLATOR_URL      = os.getenv("TRANSLATOR_URL", "http://translator:8003/")
 TRANSLATE_TIMEOUT   = float(os.getenv("TRANSLATE_TIMEOUT_SECONDS", "30"))
 FOREIGN_FORWARD_URL = os.getenv("FOREIGN_FORWARD_URL", "").strip()
+GPU_TRANSLATOR_URL  = os.getenv("GPU_TRANSLATOR_URL", "").strip()
+GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "30"))
 
 def _parse_bpipe_urls() -> list[str]:
     urls_env = os.getenv("BPIPE_URLS", "")
@@ -51,41 +52,24 @@ def _parse_bpipe_urls() -> list[str]:
 BPIPE_URLS: list[str] = _parse_bpipe_urls()
 
 _session: aiohttp.ClientSession | None = None
+_lab_config: dict | None = None
 _process_queue: asyncio.Queue | None = None
-_proc_pool: ProcessPoolExecutor | None = None
+_thread_pool: ThreadPoolExecutor | None = None
 
 _bpipe_cycle: itertools.cycle | None = None
 _bpipe_lock = asyncio.Lock()
 _bg_tasks: set = set()
-TRANSLATE_CONCURRENCY = int(os.getenv("UPIPE_TRANSLATE_CONCURRENCY", "16"))
-_translate_pending = 0
+_gpu_down_until = 0.0
 
 _stats = {
     "received": 0, "processed": 0, "forwarded": 0, "errors": 0, "dropped": 0, "filtered_lang": 0,
     "translated": 0, "translate_fallback": 0, "translate_errors": 0, "translate_identical": 0,
-    "foreign_sent": 0, "pool_restarts": 0,
+    "foreign_sent": 0, "gpu_sent": 0, "gpu_returned": 0,
 }
 
-_worker_lab: dict | None = None
 
-
-def _init_worker():
-    global _worker_lab
-    logging.getLogger().setLevel(logging.WARNING)
-    _worker_lab = lab_initialization()
-
-
-def _new_pool() -> ProcessPoolExecutor:
-    # CPU-bound (langdetect/yake/tiktoken) держит GIL — потоки не параллелятся, нужны процессы
-    return ProcessPoolExecutor(
-        max_workers=WORKERS,
-        mp_context=mp.get_context("spawn"),
-        initializer=_init_worker,
-    )
-
-
-def _process_sync(item: Item, translation: Translation | None = None) -> dict:
-    processed = process(item, _worker_lab, MAX_DEPTH_CLASSIFICATION, translation)
+def _process_sync(item: Item, lab_config: dict, translation: Translation | None = None) -> dict:
+    processed = process(item, lab_config, MAX_DEPTH_CLASSIFICATION, translation)
     return {
         "item": {
             "created_at":         str(processed.item.get("created_at", "")),
@@ -133,7 +117,7 @@ async def forward_to_bpipe(payload: dict) -> bool:
         log.error(f"❌ bpipe недоступен: {url}")
         return False
     except Exception as e:
-        log.warning(f"Ошибка отправки в bpipe {url}: {type(e).__name__}: {e}")
+        log.debug(f"Ошибка отправки в bpipe: {e}")
         return False
 
 
@@ -161,13 +145,38 @@ def _forward_foreign(raw_item: dict):
     task.add_done_callback(_bg_tasks.discard)
 
 
+async def _forward_gpu(raw_item: dict) -> bool:
+    global _gpu_down_until
+    if not GPU_TRANSLATOR_URL or _session is None or time.monotonic() < _gpu_down_until:
+        return False
+    payload = {k: v for k, v in raw_item.items() if k != "foreign_author"}
+    try:
+        async with _session.post(
+            GPU_TRANSLATOR_URL,
+            data=orjson.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=3),
+        ) as resp:
+            await resp.read()
+            if resp.status == 202:
+                _stats["gpu_sent"] += 1
+                return True
+            if resp.status == 422:
+                return False
+    except Exception:
+        pass
+    _gpu_down_until = time.monotonic() + GPU_RETRY_SECONDS
+    return False
+
+
 async def _translate_or_fallback(item: Item, raw_item: dict, lang: str) -> Translation | None:
     text = str(item.get("content", ""))
     try:
         out = await translate_remote(_session, TRANSLATOR_URL, text, lang, TRANSLATE_TIMEOUT)
     except TranslatorBusy:
         _stats["translate_fallback"] += 1
-        _forward_foreign(raw_item)
+        if not await _forward_gpu(raw_item):
+            _forward_foreign(raw_item)
         return None
     except (TranslatorUnavailable, TranslatorRejected) as e:
         _stats["translate_errors"] += 1
@@ -185,50 +194,53 @@ async def _translate_or_fallback(item: Item, raw_item: dict, lang: str) -> Trans
     return Translation(language=Language(lang.split("-")[0]), translation=Translated(out))
 
 
-async def _translate_task(item: Item, raw_item: dict, lang: str):
-    global _translate_pending
+async def _translate_then_requeue(item: Item, raw_item: dict, lang: str):
     try:
         translation = await _translate_or_fallback(item, raw_item, lang)
-        if translation is not None:
-            await _process_queue.put((item, raw_item, translation))
+        if translation is None:
+            return
+        raw_item["pretranslated"] = str(translation.translation)
+        await _process_queue.put((item, raw_item))
     except Exception as e:
         _stats["errors"] += 1
-        log.warning(f"⚠️ translate task: {type(e).__name__}: {e}")
-    finally:
-        _translate_pending -= 1
+        log.warning(f"⚠️ Ошибка фонового перевода: {e}")
 
 
-def _dispatch_translation(item: Item, raw_item: dict, lang: str):
-    global _translate_pending
-    if _translate_pending >= TRANSLATE_CONCURRENCY:
-        _stats["translate_fallback"] += 1
-        _forward_foreign(raw_item)
-        return
-    _translate_pending += 1
-    task = asyncio.create_task(_translate_task(item, raw_item, lang))
+def _spawn(coro):
+    task = asyncio.create_task(coro)
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
 
 
 async def worker_loop(worker_id: int):
-    global _stats, _proc_pool
+    global _stats
     log.info(f"👷 Upipe-воркер #{worker_id} запущен")
 
     loop = asyncio.get_event_loop()
     while True:
         try:
-            entry = await _process_queue.get()
-            item, raw_item = entry[0], entry[1]
-            translation = entry[2] if len(entry) > 2 else None
+            item, raw_item = await _process_queue.get()
 
             try:
+                translation = None
                 lang = (raw_item.get("detected_lang") or "").lower()
-                if translation is None and TRANSLATE and lang and lang != "en":
-                    _dispatch_translation(item, raw_item, lang)
+                pre = raw_item.get("pretranslated")
+                if pre:
+                    translation = Translation(
+                        language=Language(lang.split("-")[0] if lang else "en"),
+                        translation=Translated(pre),
+                    )
+                elif TRANSLATE and lang and lang != "en":
+                    _spawn(_translate_then_requeue(item, raw_item, lang))
                     continue
 
-                pool = _proc_pool
-                payload = await loop.run_in_executor(pool, _process_sync, item, translation)
+                payload = await loop.run_in_executor(
+                    _thread_pool,
+                    _process_sync,
+                    item,
+                    _lab_config,
+                    translation,
+                )
                 _stats["processed"] += 1
 
                 if raw_item.get("username"):
@@ -239,20 +251,15 @@ async def worker_loop(worker_id: int):
                 ok = await forward_to_bpipe(payload)
                 if ok:
                     _stats["forwarded"] += 1
+                    log.debug(
+                        f"✅ [{worker_id}] → bpipe | {raw_item.get('url', '')[:60]}"
+                    )
                 else:
                     _stats["errors"] += 1
 
             except NonEnglishError as e:
                 _stats["filtered_lang"] += 1
                 log.debug(f"🌐 [{worker_id}] Не-английский текст отброшен: {e}")
-
-            except BrokenProcessPool:
-                _stats["errors"] += 1
-                if pool is _proc_pool:
-                    log.error("❌ ProcessPool сломан — пересоздаю")
-                    _stats["pool_restarts"] += 1
-                    _proc_pool = _new_pool()
-                    pool.shutdown(wait=False)
 
             except Exception as e:
                 _stats["errors"] += 1
@@ -266,7 +273,8 @@ async def worker_loop(worker_id: int):
                     f"📊 recv={_stats['received']} proc={_stats['processed']} "
                     f"fwd={_stats['forwarded']} err={_stats['errors']} "
                     f"lang={_stats['filtered_lang']} dropped={_stats['dropped']} "
-                    f"transl={_stats['translated']} tr_fallback={_stats['translate_fallback']}"
+                    f"transl={_stats['translated']} tr_fallback={_stats['translate_fallback']} "
+                    f"gpu_sent={_stats['gpu_sent']} gpu_ret={_stats['gpu_returned']}"
                 )
 
         except Exception as e:
@@ -282,6 +290,8 @@ async def handle_receive_item(request: web.Request) -> web.Response:
         return web.Response(text=f"bad json: {e}", status=400)
 
     _stats["received"] += 1
+    if raw_item.get("pretranslated"):
+        _stats["gpu_returned"] += 1
 
     try:
         external_parent_id = raw_item.get("external_parent_id") or ""
@@ -317,19 +327,24 @@ async def handle_health(request: web.Request) -> web.Response:
         "status": "ok",
         "queue":  _process_queue.qsize() if _process_queue else 0,
         "bpipe_urls": BPIPE_URLS,
-        "translate": {"enabled": TRANSLATE, "url": TRANSLATOR_URL if TRANSLATE else None, "pending": _translate_pending, "concurrency": TRANSLATE_CONCURRENCY},
+        "translate": {"enabled": TRANSLATE, "url": TRANSLATOR_URL if TRANSLATE else None},
+        "gpu_translator": GPU_TRANSLATOR_URL or None,
         "stats":  _stats,
     })
 
 
 async def on_startup(app: web.Application):
-    global _session, _process_queue, _proc_pool, _bpipe_cycle
+    global _session, _lab_config, _process_queue, _thread_pool, _bpipe_cycle
 
     log.info("🔬 Инициализация upipe...")
     log.info(f"   bpipe инстансов: {len(BPIPE_URLS)} → {BPIPE_URLS}")
     log.info(f"   TRANSLATE={TRANSLATE} translator={TRANSLATOR_URL if TRANSLATE else '-'}")
+    log.info(f"   GPU translator: {GPU_TRANSLATOR_URL or 'выключен'}")
 
-    _proc_pool = _new_pool()
+    loop = asyncio.get_event_loop()
+    _thread_pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="upipe_worker")
+    _lab_config = await loop.run_in_executor(None, lab_initialization)
+
     _process_queue = asyncio.Queue()
     _bpipe_cycle   = itertools.cycle(BPIPE_URLS)
 
@@ -339,16 +354,16 @@ async def on_startup(app: web.Application):
     for i in range(WORKERS):
         asyncio.create_task(worker_loop(i))
 
-    log.info(f"✅ Upipe запущен на порту {UPIPE_PORT} ({WORKERS} воркеров, процессы)")
+    log.info(f"✅ Upipe запущен на порту {UPIPE_PORT} ({WORKERS} воркеров)")
     log.info(f"   Round-robin → {BPIPE_URLS}")
 
 
 async def on_shutdown(app: web.Application):
-    global _session, _proc_pool
+    global _session, _thread_pool
     if _session:
         await _session.close()
-    if _proc_pool:
-        _proc_pool.shutdown(wait=False, cancel_futures=True)
+    if _thread_pool:
+        _thread_pool.shutdown(wait=False)
     log.info(f"📊 Итог upipe: {_stats}")
 
 

@@ -5,10 +5,11 @@ Bpipe (standalone) — принимает обработанные элемен�
 
 Слушает: POST / на BPIPE_PORT (по умолчанию 7995)
 Отправляет в: TRANSACTIONEER_URL (по умолчанию http://127.0.0.1:8002/commit)
+
+Адаптировано для локального запуска на RTX 3050 8GB.
 """
 import asyncio
 import gc
-import itertools
 import json
 import logging
 import os
@@ -16,7 +17,6 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
 from timeit import default_timer as timerit
 from urllib.parse import urlparse, urljoin
 
@@ -49,15 +49,15 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ─── Конфигурация ─────────────────────────────────────────────
 BPIPE_PORT           = int(os.getenv("BPIPE_PORT", "7995"))
 TRANSACTIONEER_URL   = os.getenv("TRANSACTIONEER_URL", "http://127.0.0.1:8002")
-FIXED_BATCH_SIZE     = int(os.getenv("FIXED_BATCH_SIZE", "6"))
+FIXED_BATCH_SIZE     = int(os.getenv("FIXED_BATCH_SIZE", "6"))     # Меньше для RTX 3050
 BATCH_TIMEOUT_SECS   = float(os.getenv("BATCH_TIMEOUT_SECONDS", "3.0"))
-MAX_QUEUE_SIZE       = int(os.getenv("MAX_QUEUE_SIZE", "100"))
-BPIPE_MAX_AGE_SECS   = float(os.getenv("BPIPE_MAX_AGE_SECONDS", "300"))
+MAX_QUEUE_SIZE       = int(os.getenv("MAX_QUEUE_SIZE", "100"))      # Сбрасывать старые если очередь растёт
 
-_process_queue: asyncio.PriorityQueue | None = None
-_seq = itertools.count()
+# ─── Глобальное состояние ──────────────────────────────────────
+_process_queue: asyncio.Queue | None = None
 _lab_config: dict | None = None
 _live_config = None
 _session: aiohttp.ClientSession | None = None
@@ -68,8 +68,6 @@ _stats = {
     "items_sent": 0,
     "errors": 0,
     "dropped": 0,
-    "stale": 0,
-    "evicted": 0,
 }
 
 
@@ -77,42 +75,7 @@ class TooBigError(Exception):
     pass
 
 
-def _created_ts(created_at: str) -> float:
-    s = (created_at or "").rstrip("Z")
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp()
-        except ValueError:
-            continue
-    return time.time()
-
-
-def _purge_stale() -> int:
-    # Прямой доступ к внутренней куче PriorityQueue: фильтр + heapify за O(n), n<=MAX_QUEUE_SIZE.
-    # join()/task_done() не используются, поэтому счётчики Queue не нарушаются.
-    import heapq
-    heap = _process_queue._queue
-    cutoff = time.time() - BPIPE_MAX_AGE_SECS
-    fresh = [e for e in heap if -e[0] >= cutoff]
-    removed = len(heap) - len(fresh)
-    if removed:
-        heap[:] = fresh
-        heapq.heapify(heap)
-    return removed
-
-
-def _evict_oldest_if_older(new_ts: float) -> bool:
-    import heapq
-    heap = _process_queue._queue
-    if not heap:
-        return False
-    oldest = max(heap, key=lambda e: e[0])
-    if -oldest[0] >= new_ts:
-        return False
-    heap.remove(oldest)
-    heapq.heapify(heap)
-    return True
-
+# ─── Отправка в transactioneer ─────────────────────────────────
 
 async def send_batch_to_transactioneer(processed_batch: dict):
     global _session, _stats
@@ -151,11 +114,22 @@ async def send_batch_to_transactioneer(processed_batch: dict):
         _stats["errors"] += 1
 
 
+# ─── Обработка батча (в отдельном потоке) ─────────────────────
+
 def _process_batch_sync(batch, lab_config: dict) -> dict:
+    """Синхронная ML-обработка батча. Запускается в ThreadPoolExecutor."""
     return process_batch(batch, lab_config)
 
 
+# ─── Основной цикл формирования батчей ────────────────────────
+
 async def batch_processing_loop():
+    """
+    Собирает элементы из очереди в батчи и обрабатывает их.
+    Отправляет батч когда:
+      - набралось FIXED_BATCH_SIZE элементов, ИЛИ
+      - прошло BATCH_TIMEOUT_SECS с момента появления первого элемента в батче
+    """
     global _stats, _inflight
 
     loop = asyncio.get_event_loop()
@@ -163,7 +137,7 @@ async def batch_processing_loop():
 
     log.info(
         f"🔄 Batch loop запущен: размер батча={FIXED_BATCH_SIZE}, "
-        f"таймаут={BATCH_TIMEOUT_SECS}с, макс. возраст={BPIPE_MAX_AGE_SECS}с"
+        f"таймаут={BATCH_TIMEOUT_SECS}с"
     )
 
     batch_id = 0
@@ -171,27 +145,29 @@ async def batch_processing_loop():
         batch = []
         first_item_time = None
 
+        # Собираем батч
         while len(batch) < FIXED_BATCH_SIZE:
             timeout = None
             if first_item_time is not None:
-                remaining = BATCH_TIMEOUT_SECS - (time.monotonic() - first_item_time)
+                elapsed = time.monotonic() - first_item_time
+                remaining = BATCH_TIMEOUT_SECS - elapsed
                 if remaining <= 0:
                     break
                 timeout = remaining
+            else:
+                timeout = None  # Ждём первый элемент неограниченно
 
             try:
-                neg_ts, _, item = await asyncio.wait_for(_process_queue.get(), timeout=timeout)
+                item = await asyncio.wait_for(
+                    _process_queue.get(),
+                    timeout=timeout,
+                )
+                batch.append(item)
+                _inflight = len(batch)
+                if first_item_time is None:
+                    first_item_time = time.monotonic()
             except asyncio.TimeoutError:
-                break
-
-            if time.time() + neg_ts > BPIPE_MAX_AGE_SECS:
-                _stats["stale"] += 1
-                continue
-
-            batch.append(item)
-            _inflight = len(batch)
-            if first_item_time is None:
-                first_item_time = time.monotonic()
+                break  # Таймаут — отправляем что накопили
 
         if not batch:
             continue
@@ -199,6 +175,7 @@ async def batch_processing_loop():
         batch_id += 1
         log.info(f"[Batch-{batch_id}] Обрабатываем {len(batch)} элементов...")
 
+        # ML обработка в потоке (GPU)
         t0 = timerit()
         try:
             processed_batch = await loop.run_in_executor(
@@ -221,6 +198,8 @@ async def batch_processing_loop():
             _inflight = 0
 
 
+# ─── HTTP обработчики ──────────────────────────────────────────
+
 async def handle_receive_item(request: web.Request) -> web.Response:
     global _stats, _live_config
     try:
@@ -228,6 +207,7 @@ async def handle_receive_item(request: web.Request) -> web.Response:
     except Exception as e:
         return web.Response(text=f"bad json: {e}", status=400)
 
+    # Проверяем наличие translation
     translation_text = raw_item.get("translation", {}).get("translation", "")
     if not translation_text or not translation_text.strip():
         return web.Response(text="skipped_empty")
@@ -268,26 +248,17 @@ async def handle_receive_item(request: web.Request) -> web.Response:
         log.warning(f"Ошибка создания Processed: {e}")
         return web.Response(text="invalid_item", status=400)
 
-    ts = _created_ts(raw_item["item"]["created_at"])
-    if time.time() - ts > BPIPE_MAX_AGE_SECS:
-        _stats["stale"] += 1
-        return web.Response(text="stale")
-
+    # Возвращаем 503 если очередь переполнена
     if _process_queue.qsize() >= MAX_QUEUE_SIZE:
-        _stats["stale"] += _purge_stale()
-        if _process_queue.qsize() >= MAX_QUEUE_SIZE:
-            if _evict_oldest_if_older(ts):
-                _stats["evicted"] += 1
-            else:
-                _stats["dropped"] += 1
-                if _stats["dropped"] % 10 == 0:
-                    log.warning(
-                        f"🗑️  bpipe очередь переполнена — дропнуто: {_stats['dropped']} "
-                        f"(queue={_process_queue.qsize()}/{MAX_QUEUE_SIZE})"
-                    )
-                return web.Response(text="queue_full", status=503)
+        _stats["dropped"] += 1
+        if _stats["dropped"] % 10 == 0:
+            log.warning(
+                f"🗑️  bpipe очередь переполнена — дропнуто: {_stats['dropped']} "
+                f"(queue={_process_queue.qsize()}/{MAX_QUEUE_SIZE})"
+            )
+        return web.Response(text="queue_full", status=503)
 
-    await _process_queue.put((-ts, next(_seq), (id(processed_item), processed_item)))
+    await _process_queue.put((id(processed_item), processed_item))
     _stats["received"] += 1
 
     if _stats["received"] % 100 == 0:
@@ -295,7 +266,7 @@ async def handle_receive_item(request: web.Request) -> web.Response:
             f"📥 recv={_stats['received']} | "
             f"queue={_process_queue.qsize()} | "
             f"sent={_stats['items_sent']} | "
-            f"dropped={_stats['dropped']} | stale={_stats['stale']} | evicted={_stats['evicted']}"
+            f"dropped={_stats['dropped']}"
         )
 
     return web.Response(text="received")
@@ -307,7 +278,6 @@ async def handle_health(request: web.Request) -> web.Response:
         "queue": _process_queue.qsize() if _process_queue else 0,
         "stats": _stats,
         "batch_size": FIXED_BATCH_SIZE,
-        "max_age_s": BPIPE_MAX_AGE_SECS,
     })
 
 
@@ -321,8 +291,6 @@ async def handle_queue(request: web.Request) -> web.Response:
         "inflight": _inflight,
         "batch_size": FIXED_BATCH_SIZE,
         "dropped": _stats["dropped"],
-        "stale": _stats["stale"],
-        "evicted": _stats["evicted"],
     })
 
 
@@ -334,6 +302,7 @@ async def on_startup(app: web.Application):
 
     loop = asyncio.get_event_loop()
 
+    # Инициализация ML моделей
     try:
         _lab_config = await loop.run_in_executor(None, lab_initialization)
         log.info("✅ ML модели загружены")
@@ -341,6 +310,7 @@ async def on_startup(app: web.Application):
         log.error(f"❌ Ошибка загрузки моделей: {e}")
         raise
 
+    # Live конфиг (категории/метки) от Exorde
     try:
         _live_config = await get_live_configuration()
         _lab_config["live_configuration"] = _live_config
@@ -348,15 +318,16 @@ async def on_startup(app: web.Application):
     except Exception as e:
         log.warning(f"⚠️ Не удалось получить live configuration: {e}")
 
-    _process_queue = asyncio.PriorityQueue()
+    _process_queue = asyncio.Queue()
 
     connector = aiohttp.TCPConnector(limit=5, keepalive_timeout=60)
     _session = aiohttp.ClientSession(connector=connector)
 
+    # Запускаем основной цикл
     asyncio.create_task(batch_processing_loop())
 
     log.info(f"✅ Bpipe запущен на порту {BPIPE_PORT}")
-    log.info(f"   Батч: {FIXED_BATCH_SIZE} items | таймаут: {BATCH_TIMEOUT_SECS}с | макс. возраст: {BPIPE_MAX_AGE_SECS}с")
+    log.info(f"   Батч: {FIXED_BATCH_SIZE} items | таймаут: {BATCH_TIMEOUT_SECS}с")
     log.info(f"   Отправляет в transactioneer: {TRANSACTIONEER_URL}")
 
 
