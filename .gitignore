@@ -1,3 +1,4 @@
 .env
 models_cache/
 argos_data/
+ct2_models/
