@@ -9,16 +9,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# transformers>=4.46 убрал M2M100Encoder.embed_scale — конвертер ctranslate2 4.4.0 на нём падает (NLLB)
+# transformers>=4.43 убрал M2M100Encoder.embed_scale — конвертер ctranslate2 4.4.0 на нём падает (NLLB)
 RUN pip3 install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cpu \
     --extra-index-url https://pypi.org/simple \
     torch==2.5.1 \
     "numpy<2" \
     "transformers==4.41.2" \
+    "tokenizers<0.20" \
     sentencepiece sacremoses \
     "ctranslate2==4.4.0" \
     "aiohttp>=3.9.0"
+
+RUN python3 -c "import transformers; from transformers.models.m2m_100.modeling_m2m_100 import M2M100Encoder as E; import inspect; assert transformers.__version__=='4.41.2', transformers.__version__; assert 'self.embed_scale' in inspect.getsource(E.__init__); print('ok', transformers.__version__)"
 
 COPY translator_gpu.py .
 
