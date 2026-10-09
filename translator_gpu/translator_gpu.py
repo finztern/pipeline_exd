@@ -147,9 +147,10 @@ async def _send_back(item: dict, text: str):
                 _stats["returned"] += 1
                 return
             _stats["send_errors"] += 1
+            log.warning(f"upipe вернул {resp.status} на {UPIPE_URL}")
     except Exception as e:
         _stats["send_errors"] += 1
-        log.debug(f"send back error: {e}")
+        log.warning(f"send back error -> {UPIPE_URL}: {type(e).__name__}: {e}")
 
 
 async def _worker():
@@ -188,6 +189,7 @@ async def _worker():
                     _lang_counts[str(item.get("detected_lang", "")).lower()] += 1
                     sends.append(_send_back(item, out))
                 await asyncio.gather(*sends)
+                log.info(f"batch={len(items)} переведено={len(sends)} | {_stats}")
         except Exception as e:
             log.error(f"Воркер: {e}", exc_info=True)
             await asyncio.sleep(1)
