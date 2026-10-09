@@ -1,21 +1,12 @@
-"""
-Transactioneer (standalone) — получает обработанные батчи от bpipe
-и загружает их на Exorde Upload API.
-
-Слушает: POST /commit на TRANSACTIONEER_PORT (по умолчанию 8002)
-
-ВАЖНО: установи MAIN_ADDRESS в .env (твой Exorde-кошелёк)
-"""
 import asyncio
 import json
 import logging
 import os
 import sys
 import time
-from datetime import datetime
+from collections import deque
 from typing import Optional
 
-import aiohttp
 from aiohttp import web, ClientSession, FormData, ClientTimeout
 
 logging.basicConfig(
@@ -25,7 +16,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── Конфигурация ─────────────────────────────────────────────
 TRANSACTIONEER_PORT = int(os.getenv("TRANSACTIONEER_PORT", "8002"))
 UPLOAD_API_URL      = os.getenv("UPLOAD_API_URL", "http://upload.exorde.network/v1/upload")
 MAIN_ADDRESS        = os.getenv("MAIN_ADDRESS", "")
@@ -34,7 +24,7 @@ USE_PROXY           = os.getenv("USE_PROXY", "false").lower() == "true"
 PROXY_URL           = os.getenv("PROXY_URL", "")
 MAX_RETRIES         = int(os.getenv("UPLOAD_MAX_RETRIES", "3"))
 
-# ─── Статистика ───────────────────────────────────────────────
+_started = time.monotonic()
 _stats = {
     "batches_received": 0,
     "items_received": 0,
@@ -42,16 +32,48 @@ _stats = {
     "uploads_failed": 0,
     "items_accepted": 0,
 }
+_totals = {"accepted": 0, "rejected": 0, "duplicates": 0}
+_events: deque = deque()
 _active_tasks: list = []
 
+RATE_WINDOWS = (("10m", 600), ("30m", 1800), ("60m", 3600))
 
-# ─── Загрузка на Upload API ────────────────────────────────────
+
+def _record(accepted: int, rejected: int, duplicates: int):
+    now = time.monotonic()
+    _totals["accepted"] += accepted
+    _totals["rejected"] += rejected
+    _totals["duplicates"] += duplicates
+    _events.append((now, accepted, rejected, duplicates))
+    cut = now - RATE_WINDOWS[-1][1]
+    while _events and _events[0][0] < cut:
+        _events.popleft()
+
+
+def _rates() -> dict:
+    now = time.monotonic()
+    uptime = now - _started
+    out = {}
+    for name, window in RATE_WINDOWS:
+        win = max(1.0, min(float(window), uptime))
+        cut = now - window
+        a = r = d = 0
+        for ts, x, y, z in _events:
+            if ts >= cut:
+                a += x
+                r += y
+                d += z
+        out[name] = {
+            "accepted_per_sec": round(a / win, 3),
+            "rejected_per_sec": round(r / win, 3),
+            "duplicates_per_sec": round(d / win, 3),
+            "window_s": int(win),
+        }
+    return out
+
 
 async def upload_to_api(items: list, main_address: str) -> Optional[dict]:
-    """Загружает батч на Exorde Upload API. Возвращает ответ API или None."""
-
-    batch_dict = {"items": items, "kind": "SPOTTING"}
-    batch_json = json.dumps(batch_dict, default=str, ensure_ascii=False)
+    batch_json = json.dumps({"items": items, "kind": "SPOTTING"}, default=str, ensure_ascii=False)
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -84,13 +106,12 @@ async def upload_to_api(items: list, main_address: str) -> Optional[dict]:
                     timeout=ClientTimeout(total=UPLOAD_API_TIMEOUT),
                 ) as resp:
                     if resp.status == 200:
-                        response_data = await resp.json()
-                        file_id       = response_data.get("file_id", "?")
-                        total_items   = response_data.get("total_items", 0)
-                        filtered      = response_data.get("filtered_items", 0)
-                        rejected      = response_data.get("rejected_items", 0)
-                        duplicates    = response_data.get("duplicate_items", 0)
-                        proc_ms       = response_data.get("processing_time_ms", 0)
+                        data       = await resp.json()
+                        file_id    = data.get("file_id", "?")
+                        filtered   = data.get("filtered_items", 0)
+                        rejected   = data.get("rejected_items", 0)
+                        duplicates = data.get("duplicate_items", 0)
+                        proc_ms    = data.get("processing_time_ms", 0)
 
                         log.info(
                             f"✅ Загружено | file_id={file_id} | "
@@ -99,28 +120,17 @@ async def upload_to_api(items: list, main_address: str) -> Optional[dict]:
                             f"API обработка={proc_ms}ms"
                         )
 
-                        # Подробное логирование отклонённых items
                         if rejected > 0:
-                            rejection_details = response_data.get("rejection_details", [])
-                            rejected_urls     = response_data.get("rejected_urls", [])
-                            rejected_reasons  = response_data.get("rejected_reasons", [])
-                            errors            = response_data.get("errors", [])
-                            log.warning(f"⚠️ Детали отклонения: {rejection_details or rejected_urls or rejected_reasons or errors or 'нет деталей в ответе'}")
-                            log.warning(f"⚠️ Полный ответ API: {json.dumps(response_data, ensure_ascii=False)[:2000]}")
-                            # Сохраняем первый отклонённый батч для анализа
+                            log.warning(f"⚠️ Полный ответ API: {json.dumps(data, ensure_ascii=False)[:2000]}")
                             try:
-                                import os
-                                debug_path = f"/tmp/rejected_batch_{file_id}.json"
-                                with open(debug_path, "w") as dbf:
+                                with open(f"/tmp/rejected_batch_{file_id}.json", "w") as dbf:
                                     json.dump({"items": items[:3], "kind": "SPOTTING"}, dbf, default=str, ensure_ascii=False, indent=2)
-                                log.warning(f"⚠️ Первые 3 items сохранены в {debug_path}")
                             except Exception as de:
                                 log.warning(f"Не удалось сохранить debug файл: {de}")
 
-                        return response_data
-                    else:
-                        err = await resp.text()
-                        log.error(f"❌ HTTP {resp.status}: {err[:300]}")
+                        return data
+                    err = await resp.text()
+                    log.error(f"❌ HTTP {resp.status}: {err[:300]}")
 
         except asyncio.TimeoutError:
             log.error(f"⏱️ Таймаут (попытка {attempt+1}/{MAX_RETRIES})")
@@ -131,17 +141,16 @@ async def upload_to_api(items: list, main_address: str) -> Optional[dict]:
     return None
 
 
-async def _upload_task(items: list, item_count: int):
-    """Фоновая задача загрузки."""
+async def _upload_task(items: list):
     result = await upload_to_api(items, MAIN_ADDRESS)
     if result:
+        accepted = result.get("filtered_items", 0)
         _stats["uploads_success"] += 1
-        _stats["items_accepted"] += result.get("filtered_items", 0)
+        _stats["items_accepted"] += accepted
+        _record(accepted, result.get("rejected_items", 0), result.get("duplicate_items", 0))
     else:
         _stats["uploads_failed"] += 1
 
-
-# ─── HTTP обработчики ──────────────────────────────────────────
 
 async def handle_commit(request: web.Request) -> web.Response:
     global _active_tasks
@@ -153,18 +162,12 @@ async def handle_commit(request: web.Request) -> web.Response:
     if not isinstance(items, list):
         return web.Response(text="expected array", status=400)
 
-    item_count = len(items)
     _stats["batches_received"] += 1
-    _stats["items_received"] += item_count
+    _stats["items_received"] += len(items)
+    log.info(f"📥 Батч получен: {len(items)} элементов")
 
-    log.info(f"📥 Батч получен: {item_count} элементов")
-
-    # Очищаем завершённые задачи
     _active_tasks = [t for t in _active_tasks if not t.done()]
-
-    task = asyncio.create_task(_upload_task(items, item_count))
-    _active_tasks.append(task)
-
+    _active_tasks.append(asyncio.create_task(_upload_task(items)))
     return web.Response(text="received", status=200)
 
 
@@ -178,13 +181,22 @@ async def handle_health(request: web.Request) -> web.Response:
     })
 
 
+async def handle_stats(request: web.Request) -> web.Response:
+    return web.json_response({
+        "status": "ok",
+        "uptime_s": int(time.monotonic() - _started),
+        "totals": _totals,
+        "rate": _rates(),
+        "stats": _stats,
+        "active_tasks": len(_active_tasks),
+    })
+
+
 async def on_startup(app: web.Application):
     if not MAIN_ADDRESS:
         log.error("❌ MAIN_ADDRESS не задан! Установи его в .env файле")
-        log.error("   MAIN_ADDRESS=0x... (твой Exorde кошелёк)")
     else:
         log.info(f"✅ Transactioneer запущен | address={MAIN_ADDRESS[:10]}...")
-
     log.info(f"   Upload API: {UPLOAD_API_URL}")
     log.info(f"   Порт: {TRANSACTIONEER_PORT}")
 
@@ -193,6 +205,7 @@ app = web.Application(client_max_size=500 * 1024 * 1024)
 app.router.add_post("/commit", handle_commit)
 app.router.add_get("/", handle_health)
 app.router.add_get("/health", handle_health)
+app.router.add_get("/stats", handle_stats)
 app.on_startup.append(on_startup)
 
 if __name__ == "__main__":

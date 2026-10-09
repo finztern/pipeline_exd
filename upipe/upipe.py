@@ -137,7 +137,7 @@ async def _send_foreign(payload: dict):
 def _forward_foreign(raw_item: dict):
     if not FOREIGN_FORWARD_URL or _session is None:
         return
-    payload = {k: v for k, v in raw_item.items() if k not in ("detected_lang", "foreign_author")}
+    payload = {k: v for k, v in raw_item.items() if k not in ("detected_lang", "foreign_author", "lang_ok")}
     payload["author"] = raw_item.get("foreign_author", raw_item.get("author", ""))
     _stats["foreign_sent"] += 1
     task = asyncio.create_task(_send_foreign(payload))
@@ -225,11 +225,14 @@ async def worker_loop(worker_id: int):
                 translation = None
                 lang = (raw_item.get("detected_lang") or "").lower()
                 pre = raw_item.get("pretranslated")
+                content = str(item.get("content", ""))
                 if pre:
                     translation = Translation(
                         language=Language(lang.split("-")[0] if lang else "en"),
                         translation=Translated(pre),
                     )
+                elif raw_item.get("lang_ok") and any(c.isalpha() for c in content):
+                    translation = Translation(language=Language("en"), translation=Translated(content))
                 elif TRANSLATE and lang and lang != "en":
                     _spawn(_translate_then_requeue(item, raw_item, lang))
                     continue

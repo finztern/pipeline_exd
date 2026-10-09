@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import sys
 import time
 from collections import Counter, OrderedDict
@@ -42,11 +43,23 @@ TRANSLATE_BUSY_FILL   = float(os.getenv("TRANSLATE_BUSY_FILL", "0.9"))
 TRANSLATE_POLL_SEC    = float(os.getenv("TRANSLATE_POLL_SECONDS", "1.0"))
 LANG_CONFIDENCE       = float(os.getenv("LANG_CONFIDENCE_THRESHOLD", "0.90"))
 
+EN_RESCUE_MIN_HITS  = int(os.getenv("EN_RESCUE_MIN_HITS", "2"))
+EN_RESCUE_RATIO     = float(os.getenv("EN_RESCUE_RATIO", "0.15"))
+
 GPU_TRANSLATOR_URL  = os.getenv("GPU_TRANSLATOR_URL", "").strip()
 GPU_ROUTE_REASONS   = {r.strip() for r in os.getenv("GPU_ROUTE_REASONS", "queue_full").split(",") if r.strip()}
 GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "30"))
 
 LANG_ALIASES = {"zh-cn": "zh", "zh-tw": "zt", "no": "nb"}
+
+# Слова, не пересекающиеся с de/nl/af/da/no/sv/romance — langdetect часто принимает короткий en за cy/af/so/tl/nl и т.п.
+_EN_WORDS = frozenset(
+    "the and you that this with have but they what from your just like about would there their "
+    "been were them because really when who its our how then also only which not are "
+    "i'm it's don't that's can't you're i've i'll they're we're isn't didn't doesn't".split()
+)
+_WORD_RE = re.compile(r"[a-z']+")
+_STRIP_RE = re.compile(r"https?://\S+|@\w+|#\w+")
 
 _seen_ids: OrderedDict = OrderedDict()
 _DEDUP_MAX_SIZE = 100_000
@@ -55,7 +68,7 @@ _started = time.time()
 _stats = {
     "received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0,
     "foreign_sent": 0, "to_translate": 0, "truncated": 0, "errors": 0, "dropped": 0,
-    "to_gpu": 0, "gpu_failed": 0,
+    "to_gpu": 0, "gpu_failed": 0, "rescued_en": 0,
 }
 _langs_seen: Counter = Counter()
 _foreign_reasons: Counter = Counter()
@@ -73,6 +86,14 @@ def _hash_author(author: str) -> str:
     if not author:
         return ""
     return hashlib.sha1(author.encode("utf-8")).hexdigest()
+
+
+def _looks_english(text: str) -> bool:
+    words = _WORD_RE.findall(_STRIP_RE.sub(" ", text.lower()))
+    if len(words) < 4:
+        return False
+    hits = sum(1 for w in words if w in _EN_WORDS)
+    return hits >= EN_RESCUE_MIN_HITS and hits / len(words) >= EN_RESCUE_RATIO
 
 
 async def forward_to_upipe(item: dict) -> bool:
@@ -345,7 +366,14 @@ async def _process_item(item) -> str:
     gpu_route = False
     if LANG_FILTER:
         lang, prob = _detect_lang(content)
-        if lang != LANG_FILTER:
+        if lang == LANG_FILTER:
+            item["lang_ok"] = True
+        elif LANG_FILTER == "en" and _looks_english(content):
+            _stats["rescued_en"] += 1
+            if _stats["rescued_en"] % 50 == 1:
+                log.info(f"♻️ rescued en (langdetect={lang} p={prob:.2f}): {content[:100]!r}")
+            item["lang_ok"] = True
+        else:
             reason = None
             if lang is not None:
                 _langs_seen[lang] += 1
@@ -389,7 +417,8 @@ async def _process_item(item) -> str:
             log.info(
                 f"📊 recv={_stats['received']} fwd={_stats['forwarded']} "
                 f"old={_stats['filtered_old']} dup={_stats['filtered_dup']} lang={_stats['filtered_lang']} "
-                f"transl={_stats['to_translate']} gpu={_stats['to_gpu']} foreign={_stats['foreign_sent']} dropped={_stats['dropped']}"
+                f"rescued={_stats['rescued_en']} transl={_stats['to_translate']} gpu={_stats['to_gpu']} "
+                f"foreign={_stats['foreign_sent']} dropped={_stats['dropped']}"
             )
         return "OK"
 
