@@ -10,6 +10,7 @@ services:
       NLLB_MODEL:          "${NLLB_MODEL:-facebook/nllb-200-distilled-600M}"
       GPU_COMPUTE_TYPE:    "${GPU_COMPUTE_TYPE:-int8}"
       GPU_BATCH_SIZE:      "${GPU_BATCH_SIZE:-16}"
+      GPU_COLLECT_MAX:     "${GPU_COLLECT_MAX:-128}"
       GPU_BATCH_WAIT_MS:   "${GPU_BATCH_WAIT_MS:-150}"
       GPU_BEAM_SIZE:       "${GPU_BEAM_SIZE:-2}"
       GPU_QUEUE_SIZE:      "${GPU_QUEUE_SIZE:-2000}"

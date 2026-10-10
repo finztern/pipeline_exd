@@ -30,6 +30,7 @@ PORT        = int(os.getenv("GPU_TRANSLATOR_PORT", "8004"))
 UPIPE_URL   = os.getenv("UPIPE_URL", "").strip()
 QUEUE_SIZE  = int(os.getenv("GPU_QUEUE_SIZE", "2000"))
 BATCH_SIZE  = max(1, int(os.getenv("GPU_BATCH_SIZE", "16")))
+COLLECT_MAX = max(BATCH_SIZE, int(os.getenv("GPU_COLLECT_MAX", "128")))
 BATCH_WAIT  = max(0.0, float(os.getenv("GPU_BATCH_WAIT_MS", "150"))) / 1000.0
 BEAM        = int(os.getenv("GPU_BEAM_SIZE", "2"))
 MAX_TOKENS  = int(os.getenv("GPU_MAX_TOKENS", "512"))
@@ -155,7 +156,7 @@ async def _send_back(item: dict, text: str):
 
 
 async def _collect_jobs(loop) -> list:
-    max_jobs = BATCH_SIZE * 2
+    max_jobs = COLLECT_MAX
     jobs = [await _queue.get()]
     deadline = loop.time() + BATCH_WAIT
     while len(jobs) < max_jobs:
