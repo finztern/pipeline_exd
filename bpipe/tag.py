@@ -4,6 +4,7 @@ import time
 import cupy as cp
 import torch
 import gc
+from concurrent.futures import ThreadPoolExecutor
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline
 from finvader import finvader
@@ -14,6 +15,8 @@ from exorde_compat import (
 )
 
 logging.basicConfig(level=logging.INFO)
+
+_cpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tag_cpu")
 
 def clear_gpu_memory():
     try:
@@ -58,6 +61,10 @@ def tag(documents: list[str], lab_configuration):
     allocated_start, reserved_start = get_gpu_memory_info()
     logging.info(f"GPU Memory at start - Allocated: {allocated_start:.2f}GB, Reserved: {reserved_start:.2f}GB")
 
+    n_docs = len(documents)
+    order = sorted(range(n_docs), key=lambda i: len(documents[i]))
+    documents = [documents[i] for i in order]
+
     models = lab_configuration["models"]
 
     model = models['sentence_transformer']
@@ -72,12 +79,20 @@ def tag(documents: list[str], lab_configuration):
         "TextType": models['TextType']
     }
 
-    batch_size = min(len(documents), int(os.getenv("TAG_HF_BATCH_SIZE", "32")))
+    batch_size = min(len(documents), int(os.getenv("TAG_HF_BATCH_SIZE", "64")))
     logging.info(f"Using batch_size: {batch_size} for {len(documents)} documents, labels={len(classification_labels)}")
+
+    zs_batch_size = int(os.getenv("TAG_ZS_BATCH_SIZE", "120"))
 
     HF_SAFETY_KWARGS = {"truncation": True, "max_length": 512}
 
+    def _cpu_sentiment():
+        v = [sentiment_analyzer.polarity_scores(t)["compound"] for t in documents]
+        f = [finvader(t, use_sentibignomics=True, use_henry=True, indicator='compound') for t in documents]
+        return v, f
+
     try:
+        cpu_future = _cpu_pool.submit(_cpu_sentiment)
         try:
             if getattr(model, "max_seq_length", None) and model.max_seq_length > 512:
                 model.max_seq_length = 512
@@ -91,34 +106,26 @@ def tag(documents: list[str], lab_configuration):
             show_progress_bar=False
         )
         embedding_vectors = embedding_vectors.cpu().numpy()
-        soft_clear_gpu_cache()
         lap("emb")
 
         # truncation/max_length kwargs в ZeroShot-пайплайне ломаются в части версий transformers
-        classification_results = zs_pipe(documents, candidate_labels=classification_labels, batch_size=batch_size)
-        soft_clear_gpu_cache()
+        classification_results = zs_pipe(documents, candidate_labels=classification_labels, batch_size=zs_batch_size)
         lap("zs")
 
         text_type_results = text_classification_models['TextType'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
-        soft_clear_gpu_cache()
         lap("ttype")
 
         emotion_results = text_classification_models['Emotion'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
-        soft_clear_gpu_cache()
         lap("emo")
 
         irony_results = text_classification_models['Irony'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
-        soft_clear_gpu_cache()
         lap("irony")
 
         fdb_predictions = fdb_pipe(documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
-        soft_clear_gpu_cache()
         lap("fdb")
 
-        vader_scores = [sentiment_analyzer.polarity_scores(text)["compound"] for text in documents]
-        lap("vader")
-        finvader_scores = [finvader(text, use_sentibignomics=True, use_henry=True, indicator='compound') for text in documents]
-        lap("finvader")
+        vader_scores, finvader_scores = cpu_future.result()
+        lap("cpu_wait")
 
     except torch.cuda.OutOfMemoryError as e:
         logging.error(f"CUDA OOM Error during model inference: {e}")
@@ -243,8 +250,12 @@ def tag(documents: list[str], lab_configuration):
             _out.append(create_fallback_analysis())
 
     lap("build")
-    clear_gpu_memory()
+    soft_clear_gpu_cache()
     lap("clear")
+    _sorted_out = _out
+    _out = [None] * n_docs
+    for pos, orig in enumerate(order):
+        _out[orig] = _sorted_out[pos]
     allocated_end, _ = get_gpu_memory_info()
     logging.info(
         "⏱ tag n=%d total=%.2fs | %s | gpu_alloc_end=%.2fGB",
