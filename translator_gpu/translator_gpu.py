@@ -30,6 +30,7 @@ PORT        = int(os.getenv("GPU_TRANSLATOR_PORT", "8004"))
 UPIPE_URL   = os.getenv("UPIPE_URL", "").strip()
 QUEUE_SIZE  = int(os.getenv("GPU_QUEUE_SIZE", "2000"))
 BATCH_SIZE  = max(1, int(os.getenv("GPU_BATCH_SIZE", "16")))
+BATCH_WAIT  = max(0.0, float(os.getenv("GPU_BATCH_WAIT_MS", "150"))) / 1000.0
 BEAM        = int(os.getenv("GPU_BEAM_SIZE", "2"))
 MAX_TOKENS  = int(os.getenv("GPU_MAX_TOKENS", "512"))
 COMPUTE     = os.getenv("GPU_COMPUTE_TYPE", "int8")
@@ -153,16 +154,31 @@ async def _send_back(item: dict, text: str):
         log.warning(f"send back error -> {UPIPE_URL}: {type(e).__name__}: {e}")
 
 
+async def _collect_jobs(loop) -> list:
+    max_jobs = BATCH_SIZE * 2
+    jobs = [await _queue.get()]
+    deadline = loop.time() + BATCH_WAIT
+    while len(jobs) < max_jobs:
+        try:
+            jobs.append(_queue.get_nowait())
+            continue
+        except asyncio.QueueEmpty:
+            pass
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            jobs.append(await asyncio.wait_for(_queue.get(), remaining))
+        except asyncio.TimeoutError:
+            break
+    return jobs
+
+
 async def _worker():
     loop = asyncio.get_running_loop()
     while True:
         try:
-            jobs = [await _queue.get()]
-            while len(jobs) < BATCH_SIZE * 2:
-                try:
-                    jobs.append(_queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
+            jobs = await _collect_jobs(loop)
 
             groups: dict = {}
             for job in jobs:
