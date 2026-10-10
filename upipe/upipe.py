@@ -41,6 +41,7 @@ TRANSLATE_TIMEOUT   = float(os.getenv("TRANSLATE_TIMEOUT_SECONDS", "30"))
 FOREIGN_FORWARD_URL = os.getenv("FOREIGN_FORWARD_URL", "").strip()
 GPU_TRANSLATOR_URL  = os.getenv("GPU_TRANSLATOR_URL", "").strip()
 GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "30"))
+TRANSLATED_RETRIES  = max(1, int(os.getenv("UPIPE_TRANSLATED_RETRIES", "6")))
 
 def _parse_bpipe_urls() -> list[str]:
     urls_env = os.getenv("BPIPE_URLS", "")
@@ -95,6 +96,16 @@ def _process_sync(item: Item, lab_config: dict, translation: Translation | None 
 
 
 async def forward_to_bpipe(payload: dict) -> bool:
+    if not payload.get("translated"):
+        return await _post_to_bpipe(payload)
+    for attempt in range(TRANSLATED_RETRIES):
+        if await _post_to_bpipe(payload):
+            return True
+        await asyncio.sleep(min(0.5 * 2 ** attempt, 5.0))
+    return False
+
+
+async def _post_to_bpipe(payload: dict) -> bool:
     global _session, _bpipe_cycle
     if _session is None or _bpipe_cycle is None:
         return False
@@ -250,6 +261,11 @@ async def worker_loop(worker_id: int):
                     payload["item"]["username"] = raw_item["username"]
                 if raw_item.get("summary"):
                     payload["item"]["summary"] = raw_item["summary"]
+                if pre:
+                    payload["translated"] = True
+                prio = raw_item.get("priority") or raw_item.get("queue")
+                if prio:
+                    payload["priority"] = prio
 
                 ok = await forward_to_bpipe(payload)
                 if ok:

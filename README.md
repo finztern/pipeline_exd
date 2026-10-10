@@ -202,6 +202,21 @@ watch -n 1 nvidia-smi
 
 ---
 
+### 4.9. Приоритетные очереди bpipe
+
+Порядок набора батча: `translated` → `default` → `buffer`. Item без перевода и без buffer-признака идёт в `default`.
+- `translated`: `translation.language` не `en`/пусто (или `"translated": true`). Не отбрасывается до жёсткого лимита `BPIPE_QUEUE_TRANSLATED_HARD_MAX`; `BPIPE_QUEUE_TRANSLATED_MAX` мягкий (warning). upipe до `UPIPE_TRANSLATED_RETRIES` раз повторяет отправку при 503.
+- `buffer`: `priority`/`queue` == `"buffer"` на верхнем уровне JSON или `domain` из `BPIPE_BUFFER_DOMAINS` (с точкой — точное/суффиксное совпадение, без точки — подстрока). Если item одновременно translated и buffer — он translated.
+- Переполнение `default`/`buffer`: reject 503 (drop newest, старые не теряются). Buffer-item старше `BPIPE_BUFFER_TTL_SECONDS` удаляется при выборке (0 = выкл).
+- `MAX_QUEUE_SIZE` deprecated: используется только как fallback для `BPIPE_QUEUE_DEFAULT_MAX`, если тот не задан; в compose больше не пробрасывается.
+- `/queue`: `queue/max/fill` = translated+default (контракт collector), buffer — только в `queues.buffer`.
+
+```bash
+curl -s localhost:7995/queue | python3 -m json.tool   # внутри сети: docker compose exec bpipe curl -s localhost:7995/queue
+```
+
+---
+
 ## 5. Повседневные команды
 
 ```bash
