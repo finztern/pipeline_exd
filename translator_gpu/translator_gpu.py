@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
@@ -30,8 +30,7 @@ PORT        = int(os.getenv("GPU_TRANSLATOR_PORT", "8004"))
 UPIPE_URL   = os.getenv("UPIPE_URL", "").strip()
 QUEUE_SIZE  = int(os.getenv("GPU_QUEUE_SIZE", "2000"))
 BATCH_SIZE  = max(1, int(os.getenv("GPU_BATCH_SIZE", "16")))
-COLLECT_MAX = max(BATCH_SIZE, int(os.getenv("GPU_COLLECT_MAX", "128")))
-BATCH_WAIT  = max(0.0, float(os.getenv("GPU_BATCH_WAIT_MS", "150"))) / 1000.0
+BATCH_TIMEOUT = max(0.1, float(os.getenv("GPU_BATCH_TIMEOUT_SECONDS", "10")))
 BEAM        = int(os.getenv("GPU_BEAM_SIZE", "2"))
 MAX_TOKENS  = int(os.getenv("GPU_MAX_TOKENS", "512"))
 COMPUTE     = os.getenv("GPU_COMPUTE_TYPE", "int8")
@@ -74,6 +73,8 @@ _started = time.monotonic()
 _opus_by_lang: dict = {}
 _nllb = None
 _lang_counts: Counter = Counter()
+_done_ts: deque = deque()
+RATE_WINDOWS = {"10m": 600, "30m": 1800, "60m": 3600}
 _stats = {
     "received": 0, "translated": 0, "returned": 0, "identical": 0,
     "unsupported": 0, "rejected_busy": 0, "errors": 0, "send_errors": 0,
@@ -155,58 +156,75 @@ async def _send_back(item: dict, text: str):
         log.warning(f"send back error -> {UPIPE_URL}: {type(e).__name__}: {e}")
 
 
-async def _collect_jobs(loop) -> list:
-    max_jobs = COLLECT_MAX
-    jobs = [await _queue.get()]
-    deadline = loop.time() + BATCH_WAIT
-    while len(jobs) < max_jobs:
-        try:
-            jobs.append(_queue.get_nowait())
+def _record_done(n: int):
+    now = time.monotonic()
+    _done_ts.append((now, n))
+    while _done_ts and _done_ts[0][0] < now - 3600:
+        _done_ts.popleft()
+
+
+def _rates() -> dict:
+    now = time.monotonic()
+    up = max(1.0, now - _started)
+    out = {}
+    for name, w in RATE_WINDOWS.items():
+        total = sum(n for t, n in _done_ts if t >= now - w)
+        out[name] = round(total / min(w, up), 3)
+    return out
+
+
+async def _process_batch(loop, backend: Backend, items: list):
+    items.sort(key=lambda j: len(j[0]["content"]))
+    texts = [j[0]["content"] for j in items]
+    srcs = [j[2] for j in items]
+    try:
+        outs = await loop.run_in_executor(_pool, _run_group, backend, texts, srcs)
+    except Exception as e:
+        _stats["errors"] += len(items)
+        log.error(f"Ошибка перевода батча: {e}", exc_info=True)
+        return
+
+    sends = []
+    for (item, _, _), out in zip(items, outs):
+        out = out.strip()
+        if not out or out == item["content"].strip():
+            _stats["identical"] += 1
             continue
-        except asyncio.QueueEmpty:
-            pass
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            break
-        try:
-            jobs.append(await asyncio.wait_for(_queue.get(), remaining))
-        except asyncio.TimeoutError:
-            break
-    return jobs
+        _stats["translated"] += 1
+        _lang_counts[str(item.get("detected_lang", "")).lower()] += 1
+        sends.append(_send_back(item, out))
+    _record_done(len(sends))
+    await asyncio.gather(*sends)
+    log.info(f"batch={len(items)} переведено={len(sends)} | {_stats}")
 
 
 async def _worker():
     loop = asyncio.get_running_loop()
+    buckets: dict = {}
     while True:
         try:
-            jobs = await _collect_jobs(loop)
+            if buckets:
+                nearest = min(b["deadline"] for b in buckets.values())
+                timeout = max(0.0, nearest - loop.time())
+            else:
+                timeout = None
+            try:
+                job = await asyncio.wait_for(_queue.get(), timeout)
+                key = id(job[1])
+                bucket = buckets.get(key)
+                if bucket is None:
+                    bucket = buckets[key] = {
+                        "backend": job[1], "items": [], "deadline": loop.time() + BATCH_TIMEOUT,
+                    }
+                bucket["items"].append(job)
+            except asyncio.TimeoutError:
+                pass
 
-            groups: dict = {}
-            for job in jobs:
-                groups.setdefault(id(job[1]), (job[1], []))[1].append(job)
-
-            for backend, items in groups.values():
-                items.sort(key=lambda j: len(j[0]["content"]))
-                texts = [j[0]["content"] for j in items]
-                srcs = [j[2] for j in items]
-                try:
-                    outs = await loop.run_in_executor(_pool, _run_group, backend, texts, srcs)
-                except Exception as e:
-                    _stats["errors"] += len(items)
-                    log.error(f"Ошибка перевода батча: {e}", exc_info=True)
-                    continue
-
-                sends = []
-                for (item, _, _), out in zip(items, outs):
-                    out = out.strip()
-                    if not out or out == item["content"].strip():
-                        _stats["identical"] += 1
-                        continue
-                    _stats["translated"] += 1
-                    _lang_counts[str(item.get("detected_lang", "")).lower()] += 1
-                    sends.append(_send_back(item, out))
-                await asyncio.gather(*sends)
-                log.info(f"batch={len(items)} переведено={len(sends)} | {_stats}")
+            now = loop.time()
+            ready = [k for k, b in buckets.items() if len(b["items"]) >= BATCH_SIZE or b["deadline"] <= now]
+            for k in ready:
+                b = buckets.pop(k)
+                await _process_batch(loop, b["backend"], b["items"])
         except Exception as e:
             log.error(f"Воркер: {e}", exc_info=True)
             await asyncio.sleep(1)
@@ -251,6 +269,9 @@ async def handle_stats(request: web.Request) -> web.Response:
     return web.json_response({
         "uptime_s": int(time.monotonic() - _started),
         "queue": _queue.qsize() if _queue else 0,
+        "batch_size": BATCH_SIZE,
+        "batch_timeout_s": BATCH_TIMEOUT,
+        "rate_per_sec": _rates(),
         "stats": _stats,
         "languages": dict(_lang_counts),
     })
