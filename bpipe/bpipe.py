@@ -62,6 +62,7 @@ _lab_config: dict | None = None
 _live_config = None
 _session: aiohttp.ClientSession | None = None
 _inflight = 0
+_send_tasks: set = set()
 _stats = {
     "received": 0,
     "batches_processed": 0,
@@ -187,7 +188,9 @@ async def batch_processing_loop():
             t1 = timerit()
             log.info(f"[Batch-{batch_id}] ✅ ML готово за {t1-t0:.2f}с")
 
-            await send_batch_to_transactioneer(processed_batch)
+            task = asyncio.create_task(send_batch_to_transactioneer(processed_batch))
+            _send_tasks.add(task)
+            task.add_done_callback(_send_tasks.discard)
 
         except TooBigError as e:
             log.warning(f"[Batch-{batch_id}] TooBigError: {e}")
