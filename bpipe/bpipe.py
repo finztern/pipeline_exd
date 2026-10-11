@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from timeit import default_timer as timerit
 from urllib.parse import urlparse, urljoin
@@ -54,10 +55,19 @@ BPIPE_PORT           = int(os.getenv("BPIPE_PORT", "7995"))
 TRANSACTIONEER_URL   = os.getenv("TRANSACTIONEER_URL", "http://127.0.0.1:8002")
 FIXED_BATCH_SIZE     = int(os.getenv("FIXED_BATCH_SIZE", "6"))     # Меньше для RTX 3050
 BATCH_TIMEOUT_SECS   = float(os.getenv("BATCH_TIMEOUT_SECONDS", "3.0"))
-MAX_QUEUE_SIZE       = int(os.getenv("MAX_QUEUE_SIZE", "100"))      # Сбрасывать старые если очередь растёт
+
+QUEUE_TRANSLATED_MAX      = int(os.getenv("BPIPE_QUEUE_TRANSLATED_MAX", "100"))
+QUEUE_TRANSLATED_HARD_MAX = max(QUEUE_TRANSLATED_MAX, int(os.getenv("BPIPE_QUEUE_TRANSLATED_HARD_MAX", "1000")))
+QUEUE_DEFAULT_MAX         = int(os.getenv("BPIPE_QUEUE_DEFAULT_MAX") or os.getenv("MAX_QUEUE_SIZE") or "200")
+QUEUE_BUFFER_MAX          = int(os.getenv("BPIPE_QUEUE_BUFFER_MAX", "500"))
+BUFFER_TTL_SECS           = float(os.getenv("BPIPE_BUFFER_TTL_SECONDS", "7200"))
+BUFFER_DOMAINS            = [d.strip().lower() for d in os.getenv("BPIPE_BUFFER_DOMAINS", "").split(",") if d.strip()]
 
 # ─── Глобальное состояние ──────────────────────────────────────
-_process_queue: asyncio.Queue | None = None
+_q_translated: deque = deque()
+_q_default: deque = deque()
+_q_buffer: deque = deque()
+_wake: asyncio.Event | None = None
 _lab_config: dict | None = None
 _live_config = None
 _session: aiohttp.ClientSession | None = None
@@ -69,6 +79,13 @@ _stats = {
     "items_sent": 0,
     "errors": 0,
     "dropped": 0,
+    "dropped_translated": 0,
+    "dropped_default": 0,
+    "dropped_buffer": 0,
+    "expired_buffer": 0,
+    "received_translated": 0,
+    "received_default": 0,
+    "received_buffer": 0,
 }
 
 
@@ -122,15 +139,87 @@ def _process_batch_sync(batch, lab_config: dict) -> dict:
     return process_batch(batch, lab_config)
 
 
+# ─── Приоритетные очереди ─────────────────────────────────────
+
+def _domain_is_buffer(domain: str) -> bool:
+    domain = (domain or "").strip().lower()
+    if not domain:
+        return False
+    for d in BUFFER_DOMAINS:
+        if "." in d:
+            if domain == d or domain.endswith("." + d):
+                return True
+        elif d in domain:
+            return True
+    return False
+
+
+def _classify(raw_item: dict) -> str:
+    translation = raw_item.get("translation") or {}
+    lang = str(translation.get("language") or "").strip().lower().split("-")[0]
+    if raw_item.get("translated") is True or lang not in ("", "en"):
+        return "translated"
+    if (
+        raw_item.get("priority") == "buffer"
+        or raw_item.get("queue") == "buffer"
+        or _domain_is_buffer((raw_item.get("item") or {}).get("domain", ""))
+    ):
+        return "buffer"
+    return "default"
+
+
+def _purge_expired_buffer():
+    if BUFFER_TTL_SECS <= 0:
+        return
+    cutoff = time.monotonic() - BUFFER_TTL_SECS
+    while _q_buffer and _q_buffer[0][0] < cutoff:
+        _q_buffer.popleft()
+        _stats["expired_buffer"] += 1
+
+
+def _pop_next():
+    if _q_translated:
+        return _q_translated.popleft()[1]
+    if _q_default:
+        return _q_default.popleft()[1]
+    _purge_expired_buffer()
+    if _q_buffer:
+        return _q_buffer.popleft()[1]
+    return None
+
+
+def _enqueue(kind: str, entry) -> bool:
+    now = time.monotonic()
+    if kind == "translated":
+        if len(_q_translated) >= QUEUE_TRANSLATED_HARD_MAX:
+            _stats["dropped_translated"] += 1
+            return False
+        if len(_q_translated) >= QUEUE_TRANSLATED_MAX and _stats["received_translated"] % 20 == 0:
+            log.warning(
+                f"translated сверх мягкого лимита: {len(_q_translated)}/{QUEUE_TRANSLATED_MAX} "
+                f"(жёсткий {QUEUE_TRANSLATED_HARD_MAX})"
+            )
+        _q_translated.append((now, entry))
+    elif kind == "buffer":
+        if len(_q_buffer) >= QUEUE_BUFFER_MAX:
+            _purge_expired_buffer()
+        if len(_q_buffer) >= QUEUE_BUFFER_MAX:
+            _stats["dropped_buffer"] += 1
+            return False
+        _q_buffer.append((now, entry))
+    else:
+        if len(_q_default) >= QUEUE_DEFAULT_MAX:
+            _stats["dropped_default"] += 1
+            return False
+        _q_default.append((now, entry))
+    _stats[f"received_{kind}"] += 1
+    _wake.set()
+    return True
+
+
 # ─── Основной цикл формирования батчей ────────────────────────
 
 async def batch_processing_loop():
-    """
-    Собирает элементы из очереди в батчи и обрабатывает их.
-    Отправляет батч когда:
-      - набралось FIXED_BATCH_SIZE элементов, ИЛИ
-      - прошло BATCH_TIMEOUT_SECS с момента появления первого элемента в батче
-    """
     global _stats, _inflight
 
     loop = asyncio.get_event_loop()
@@ -146,29 +235,27 @@ async def batch_processing_loop():
         batch = []
         first_item_time = None
 
-        # Собираем батч
         while len(batch) < FIXED_BATCH_SIZE:
-            timeout = None
-            if first_item_time is not None:
-                elapsed = time.monotonic() - first_item_time
-                remaining = BATCH_TIMEOUT_SECS - elapsed
-                if remaining <= 0:
-                    break
-                timeout = remaining
-            else:
-                timeout = None  # Ждём первый элемент неограниченно
-
-            try:
-                item = await asyncio.wait_for(
-                    _process_queue.get(),
-                    timeout=timeout,
-                )
+            item = _pop_next()
+            if item is not None:
                 batch.append(item)
                 _inflight = len(batch)
                 if first_item_time is None:
                     first_item_time = time.monotonic()
+                continue
+
+            timeout = None
+            if first_item_time is not None:
+                timeout = BATCH_TIMEOUT_SECS - (time.monotonic() - first_item_time)
+                if timeout <= 0:
+                    break
+
+            # Между пустым _pop_next() и clear() нет await — wakeup не теряется
+            _wake.clear()
+            try:
+                await asyncio.wait_for(_wake.wait(), timeout=timeout)
             except asyncio.TimeoutError:
-                break  # Таймаут — отправляем что накопили
+                break
 
         if not batch:
             continue
@@ -251,23 +338,22 @@ async def handle_receive_item(request: web.Request) -> web.Response:
         log.warning(f"Ошибка создания Processed: {e}")
         return web.Response(text="invalid_item", status=400)
 
-    # Возвращаем 503 если очередь переполнена
-    if _process_queue.qsize() >= MAX_QUEUE_SIZE:
+    kind = _classify(raw_item)
+    if not _enqueue(kind, (id(processed_item), processed_item)):
         _stats["dropped"] += 1
         if _stats["dropped"] % 10 == 0:
             log.warning(
-                f"🗑️  bpipe очередь переполнена — дропнуто: {_stats['dropped']} "
-                f"(queue={_process_queue.qsize()}/{MAX_QUEUE_SIZE})"
+                f"🗑️  bpipe очередь {kind} переполнена — дропнуто всего: {_stats['dropped']} "
+                f"(t={len(_q_translated)} d={len(_q_default)} b={len(_q_buffer)})"
             )
         return web.Response(text="queue_full", status=503)
 
-    await _process_queue.put((id(processed_item), processed_item))
     _stats["received"] += 1
 
     if _stats["received"] % 100 == 0:
         log.info(
             f"📥 recv={_stats['received']} | "
-            f"queue={_process_queue.qsize()} | "
+            f"t={len(_q_translated)} d={len(_q_default)} b={len(_q_buffer)} | "
             f"sent={_stats['items_sent']} | "
             f"dropped={_stats['dropped']}"
         )
@@ -275,22 +361,52 @@ async def handle_receive_item(request: web.Request) -> web.Response:
     return web.Response(text="received")
 
 
+def _queues_snapshot() -> dict:
+    t, d, b = len(_q_translated), len(_q_default), len(_q_buffer)
+    return {
+        "translated": {
+            "queue": t, "max": QUEUE_TRANSLATED_MAX, "hard_max": QUEUE_TRANSLATED_HARD_MAX,
+            "fill": round(t / QUEUE_TRANSLATED_MAX, 3) if QUEUE_TRANSLATED_MAX else 0.0,
+            "dropped": _stats["dropped_translated"],
+        },
+        "default": {
+            "queue": d, "max": QUEUE_DEFAULT_MAX,
+            "fill": round(d / QUEUE_DEFAULT_MAX, 3) if QUEUE_DEFAULT_MAX else 0.0,
+            "dropped": _stats["dropped_default"],
+        },
+        "buffer": {
+            "queue": b, "max": QUEUE_BUFFER_MAX,
+            "fill": round(b / QUEUE_BUFFER_MAX, 3) if QUEUE_BUFFER_MAX else 0.0,
+            "dropped": _stats["dropped_buffer"],
+            "expired": _stats["expired_buffer"],
+            "ttl_s": BUFFER_TTL_SECS,
+        },
+    }
+
+
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "ok",
-        "queue": _process_queue.qsize() if _process_queue else 0,
+        "queue": len(_q_translated) + len(_q_default),
+        "queue_total": len(_q_translated) + len(_q_default) + len(_q_buffer),
+        "queues": _queues_snapshot(),
+        "inflight": _inflight,
         "stats": _stats,
         "batch_size": FIXED_BATCH_SIZE,
     })
 
 
 async def handle_queue(request: web.Request) -> web.Response:
-    size = _process_queue.qsize() if _process_queue else 0
+    # queue/max/fill = translated+default (контракт для collector); buffer — только в "queues"
+    size = len(_q_translated) + len(_q_default)
+    mx = QUEUE_TRANSLATED_MAX + QUEUE_DEFAULT_MAX
     return web.json_response({
-        "ready": _process_queue is not None,
+        "ready": _wake is not None,
         "queue": size,
-        "max": MAX_QUEUE_SIZE,
-        "fill": round(size / MAX_QUEUE_SIZE, 3) if MAX_QUEUE_SIZE else 0.0,
+        "max": mx,
+        "fill": round(size / mx, 3) if mx else 0.0,
+        "queue_total": size + len(_q_buffer),
+        "queues": _queues_snapshot(),
         "inflight": _inflight,
         "batch_size": FIXED_BATCH_SIZE,
         "dropped": _stats["dropped"],
@@ -298,7 +414,7 @@ async def handle_queue(request: web.Request) -> web.Response:
 
 
 async def on_startup(app: web.Application):
-    global _session, _lab_config, _live_config, _process_queue
+    global _session, _lab_config, _live_config, _wake
 
     log.info("🔬 Инициализация ML-моделей bpipe...")
     log.info("   (первая загрузка занимает 5-15 минут — скачиваются модели HuggingFace)")
@@ -321,7 +437,7 @@ async def on_startup(app: web.Application):
     except Exception as e:
         log.warning(f"⚠️ Не удалось получить live configuration: {e}")
 
-    _process_queue = asyncio.Queue()
+    _wake = asyncio.Event()
 
     connector = aiohttp.TCPConnector(limit=5, keepalive_timeout=60)
     _session = aiohttp.ClientSession(connector=connector)
@@ -331,6 +447,11 @@ async def on_startup(app: web.Application):
 
     log.info(f"✅ Bpipe запущен на порту {BPIPE_PORT}")
     log.info(f"   Батч: {FIXED_BATCH_SIZE} items | таймаут: {BATCH_TIMEOUT_SECS}с")
+    log.info(
+        f"   Очереди: translated={QUEUE_TRANSLATED_MAX} (жёстк. {QUEUE_TRANSLATED_HARD_MAX}) "
+        f"default={QUEUE_DEFAULT_MAX} buffer={QUEUE_BUFFER_MAX} ttl={BUFFER_TTL_SECS}с "
+        f"buffer_domains={BUFFER_DOMAINS}"
+    )
     log.info(f"   Отправляет в transactioneer: {TRANSACTIONEER_URL}")
 
 
