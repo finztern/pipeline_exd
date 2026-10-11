@@ -6,7 +6,7 @@ services:
     environment:
       GPU_TRANSLATOR_PORT: "8004"
       UPIPE_URL:           "${UPIPE_URL}"
-      OPUS_MODELS:         "${OPUS_MODELS:-de:Helsinki-NLP/opus-mt-de-en,fr:Helsinki-NLP/opus-mt-fr-en,es:Helsinki-NLP/opus-mt-es-en,it:Helsinki-NLP/opus-mt-it-en,pt:Helsinki-NLP/opus-mt-ROMANCE-en}"
+      OPUS_MODELS:         "${OPUS_MODELS:-de:Helsinki-NLP/opus-mt-de-en,fr:Helsinki-NLP/opus-mt-fr-en,es:Helsinki-NLP/opus-mt-es-en,it:Helsinki-NLP/opus-mt-it-en,pt:Helsinki-NLP/opus-mt-ROMANCE-en,ru:Helsinki-NLP/opus-mt-ru-en,tr:Helsinki-NLP/opus-mt-tr-en,nl:Helsinki-NLP/opus-mt-nl-en,id:Helsinki-NLP/opus-mt-id-en,ar:Helsinki-NLP/opus-mt-ar-en,sv:Helsinki-NLP/opus-mt-sv-en,fi:Helsinki-NLP/opus-mt-fi-en,da:Helsinki-NLP/opus-mt-da-en,cs:Helsinki-NLP/opus-mt-cs-en,uk:Helsinki-NLP/opus-mt-uk-en,hu:Helsinki-NLP/opus-mt-hu-en,bg:Helsinki-NLP/opus-mt-bg-en,ca:Helsinki-NLP/opus-mt-ca-en,pl:Helsinki-NLP/opus-mt-pl-en,vi:Helsinki-NLP/opus-mt-vi-en,sk:Helsinki-NLP/opus-mt-sk-en,el:Helsinki-NLP/opus-mt-el-en}"
       NLLB_MODEL:          "${NLLB_MODEL:-facebook/nllb-200-distilled-600M}"
       GPU_COMPUTE_TYPE:    "${GPU_COMPUTE_TYPE:-int8}"
       GPU_BATCH_SIZE:      "${GPU_BATCH_SIZE:-16}"

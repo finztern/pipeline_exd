@@ -117,8 +117,13 @@ def _load():
     cache = {}
     for lang, name in OPUS_MODELS.items():
         if name not in cache:
-            cache[name] = Backend(name, False)
-        _opus_by_lang[lang] = cache[name]
+            try:
+                cache[name] = Backend(name, False)
+            except Exception as e:
+                cache[name] = None
+                log.warning(f"Opus {name} не загрузился ({type(e).__name__}: {e}) — {lang} уйдёт на NLLB")
+        if cache[name] is not None:
+            _opus_by_lang[lang] = cache[name]
     _nllb = Backend(NLLB_NAME, True)
 
 
