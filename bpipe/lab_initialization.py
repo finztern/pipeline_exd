@@ -37,6 +37,11 @@ from finvader import finvader
 from huggingface_hub import hf_hub_download
 
 
+CLASSIFICATION_BACKEND = os.getenv("CLASSIFICATION_BACKEND", "minilm_cosine").strip().lower()
+if CLASSIFICATION_BACKEND not in ("zs", "minilm_cosine"):
+    raise ValueError(f"CLASSIFICATION_BACKEND должен быть zs|minilm_cosine, получено: {CLASSIFICATION_BACKEND!r}")
+
+
 def clear_gpu_memory():
     try:
         if torch.cuda.is_available():
@@ -74,25 +79,26 @@ def initialize_models(device):
 
     torch_device = device
 
-    # ── Zero-shot classification (DeBERTa, обычный PyTorch) ───────────────────
-    logging.info("[TAGGING] Loading: MoritzLaurer/deberta-v3-xsmall-zeroshot-v1.1-all-33")
-    _zs_id = "MoritzLaurer/deberta-v3-xsmall-zeroshot-v1.1-all-33"
-    _zs_tokenizer = AutoTokenizer.from_pretrained(_zs_id)
-    if not _zs_tokenizer.model_max_length or _zs_tokenizer.model_max_length > 100_000:
-        _zs_tokenizer.model_max_length = 512
-    else:
-        _zs_tokenizer.model_max_length = min(_zs_tokenizer.model_max_length, 512)
-    # fp16 только на GPU (device>=0) — на CPU половинная точность не ускоряет,
-    # а местами вообще не поддерживается ядрами PyTorch.
     _dtype = torch.float16 if device >= 0 else None
-    _zs_model = AutoModelForSequenceClassification.from_pretrained(_zs_id, torch_dtype=_dtype)
-    models["zs_pipe"] = pipeline(
-        "zero-shot-classification",
-        model=_zs_model,
-        tokenizer=_zs_tokenizer,
-        device=torch_device,
-    )
-    clear_gpu_memory()
+
+    if CLASSIFICATION_BACKEND == "zs":
+        logging.info("[TAGGING] Loading: MoritzLaurer/deberta-v3-xsmall-zeroshot-v1.1-all-33")
+        _zs_id = "MoritzLaurer/deberta-v3-xsmall-zeroshot-v1.1-all-33"
+        _zs_tokenizer = AutoTokenizer.from_pretrained(_zs_id)
+        if not _zs_tokenizer.model_max_length or _zs_tokenizer.model_max_length > 100_000:
+            _zs_tokenizer.model_max_length = 512
+        else:
+            _zs_tokenizer.model_max_length = min(_zs_tokenizer.model_max_length, 512)
+        _zs_model = AutoModelForSequenceClassification.from_pretrained(_zs_id, torch_dtype=_dtype)
+        models["zs_pipe"] = pipeline(
+            "zero-shot-classification",
+            model=_zs_model,
+            tokenizer=_zs_tokenizer,
+            device=torch_device,
+        )
+        clear_gpu_memory()
+    else:
+        logging.info("[TAGGING] CLASSIFICATION_BACKEND=minilm_cosine: deberta zs_pipe не грузится")
 
     text_classification_models = [
         ("Emotion",  "SamLowe/roberta-base-go_emotions"),
@@ -227,10 +233,10 @@ def lab_initialization():
         ).json()
         logging.info("[LAB INIT] Classification labels loaded.")
         logging.info(
-            f"[LAB INIT] Zero-shot labels count: {len(labels)} — "
-            f"zs_pipe считает NLI-проход batch_size×{len(labels)} пар текст/лейбл на КАЖДЫЙ батч, "
-            f"это главный множитель нагрузки на zs_pipe (см. tag.py)"
+            f"[LAB INIT] Classification labels count: {len(labels)}, backend={CLASSIFICATION_BACKEND}"
         )
+        if CLASSIFICATION_BACKEND == "zs":
+            logging.info(f"[LAB INIT] zs_pipe считает NLI-проход batch_size×{len(labels)} пар на каждый батч")
     except Exception as e:
         logging.error(f"[LAB INIT] Labels fetch failed: {e}")
         # Пустой labeldict → classification_labels=[] в tag.py → zs_pipe падает →
@@ -245,6 +251,7 @@ def lab_initialization():
         "remove_stopwords":    False,
         "installed_languages": [],
         "models":              models,
+        "classification_backend": CLASSIFICATION_BACKEND,
     }
 
     logging.info("[LAB INIT] Done.")

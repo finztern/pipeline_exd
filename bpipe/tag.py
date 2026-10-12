@@ -2,6 +2,7 @@ import logging
 import os
 import time
 import cupy as cp
+import numpy as np
 import torch
 import gc
 from concurrent.futures import ThreadPoolExecutor
@@ -44,6 +45,34 @@ def get_gpu_memory_info():
         return allocated, reserved
     return 0, 0
 
+_label_cache = {"key": None, "emb": None}
+_cls_batches = 0
+CLASSIFICATION_LOG_EVERY = max(1, int(os.getenv("CLASSIFICATION_LOG_EVERY", "20")))
+
+
+def _normalize(m):
+    return m / np.clip(np.linalg.norm(m, axis=1, keepdims=True), 1e-12, None)
+
+
+def _label_embeddings(model, labels):
+    key = tuple(labels)
+    if _label_cache["key"] != key:
+        emb = model.encode(labels, convert_to_numpy=True, device='cuda', show_progress_bar=False)
+        _label_cache["emb"] = _normalize(np.asarray(emb, dtype=np.float32))
+        _label_cache["key"] = key
+        logging.info(f"[CLS] label embeddings пересчитаны: labels={len(labels)}")
+    return _label_cache["emb"]
+
+
+def classify_cosine(model, text_embeddings, labels):
+    label_emb = _label_embeddings(model, labels)
+    sims = _normalize(np.asarray(text_embeddings, dtype=np.float32)) @ label_emb.T
+    best = sims.argmax(axis=1)
+    # score = (cos + 1) / 2, clip в [0, 1]
+    scores = np.clip((sims[np.arange(len(best)), best] + 1.0) / 2.0, 0.0, 1.0)
+    return [{"labels": [labels[int(b)]], "scores": [float(sc)]} for b, sc in zip(best, scores)]
+
+
 def tag(documents: list[str], lab_configuration):
     assert documents is not None and len(documents) > 0
     logging.info(f"Starting Tagging Batch pipeline for {len(documents)} documents...")
@@ -68,7 +97,8 @@ def tag(documents: list[str], lab_configuration):
     models = lab_configuration["models"]
 
     model = models['sentence_transformer']
-    zs_pipe = models['zs_pipe']
+    backend = lab_configuration.get("classification_backend", "zs")
+    zs_pipe = models['zs_pipe'] if backend == "zs" else None
     classification_labels = list(lab_configuration["labeldict"].keys())
     sentiment_analyzer = models['sentiment_analyzer']
     fdb_pipe = models['fdb_pipe']
@@ -108,9 +138,13 @@ def tag(documents: list[str], lab_configuration):
         embedding_vectors = embedding_vectors.cpu().numpy()
         lap("emb")
 
-        # truncation/max_length kwargs в ZeroShot-пайплайне ломаются в части версий transformers
-        classification_results = zs_pipe(documents, candidate_labels=classification_labels, batch_size=zs_batch_size)
-        lap("zs")
+        if backend == "minilm_cosine":
+            classification_results = classify_cosine(model, embedding_vectors, classification_labels)
+        else:
+            # truncation/max_length kwargs в ZeroShot-пайплайне ломаются в части версий transformers
+            classification_results = zs_pipe(documents, candidate_labels=classification_labels, batch_size=zs_batch_size)
+        lap("cls")
+        classification_ms = timings.pop("cls") * 1000
 
         text_type_results = text_classification_models['TextType'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
         lap("ttype")
@@ -258,11 +292,18 @@ def tag(documents: list[str], lab_configuration):
         _out[orig] = _sorted_out[pos]
     allocated_end, _ = get_gpu_memory_info()
     logging.info(
-        "⏱ tag n=%d total=%.2fs | %s | gpu_alloc_end=%.2fGB",
+        "⏱ tag n=%d total=%.2fs | %s | classification_ms=%.1f (%s) | gpu_alloc_end=%.2fGB",
         len(_out), time.perf_counter() - t_start,
         " ".join(f"{k}={v:.2f}" for k, v in timings.items()),
-        allocated_end,
+        classification_ms, backend, allocated_end,
     )
+    global _cls_batches
+    _cls_batches += 1
+    if _cls_batches % CLASSIFICATION_LOG_EVERY == 1:
+        logging.info(
+            "[CLS] backend=%s labels=%d batch_ms=%.1f classification_ms=%.1f",
+            backend, len(classification_labels), (time.perf_counter() - t_start) * 1000, classification_ms,
+        )
 
     return _out
 
