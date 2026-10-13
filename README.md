@@ -234,3 +234,11 @@ docker compose down -v              # остановить + стереть ке
 - **CUDA out of memory** — снизь `FIXED_BATCH_SIZE` в `.env` (сейчас 6, можно до 3-4).
 - **transactioneer не может отправить батч** — проверь VPN (пункт 4.1), проверь `MAIN_ADDRESS`.
 - **HuggingFace не скачивается (заблокирован)** — поставь `USE_PROXY_BPIPE=true` и `USE_PROXY_UPIPE=true` в `.env`, `docker compose up -d --build bpipe upipe`.
+
+## Classification backend (bpipe)
+
+`CLASSIFICATION_BACKEND=minilm_cosine|zs` (default `minilm_cosine`).
+- `minilm_cosine` — label = argmax cosine(text_emb, label_emb) по уже посчитанным эмбеддингам MiniLM; `score = clip((cos+1)/2, 0, 1)`. DeBERTa zs_pipe не грузится (меньше VRAM, быстрее батч). Эмбеддинги лейблов кэшируются и пересчитываются при смене `labeldict`.
+- `zs` — прежний zero-shot DeBERTa.
+- Откат: `CLASSIFICATION_BACKEND=zs` в `.env` → `docker compose up -d --force-recreate bpipe` (пересборка не нужна).
+- Лог: `[CLS] backend=... labels=N batch_ms=... classification_ms=...` раз в `CLASSIFICATION_LOG_EVERY` батчей (default 20); `classification_ms` также в строке `⏱ tag`.
