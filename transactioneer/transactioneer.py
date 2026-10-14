@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from typing import Optional
 
 from aiohttp import web, ClientSession, FormData, ClientTimeout
@@ -37,6 +37,40 @@ _events: deque = deque()
 _active_tasks: list = []
 
 RATE_WINDOWS = (("10m", 600), ("30m", 1800), ("60m", 3600))
+_dom_buckets: deque = deque()
+_dom_totals = {"s": Counter(), "x": Counter()}
+_DOM_MAX = 1000
+
+
+def _dom_record(items: list, kind: str):
+    minute = int(time.time() // 60)
+    if not _dom_buckets or _dom_buckets[-1][0] != minute:
+        _dom_buckets.append((minute, {"s": Counter(), "x": Counter()}))
+        while _dom_buckets and _dom_buckets[0][0] <= minute - 60:
+            _dom_buckets.popleft()
+    for it in items:
+        try:
+            domain = str(it["item"]["domain"]).strip().lower()[:100] or "unknown"
+        except Exception:
+            domain = "unknown"
+        if domain not in _dom_totals[kind] and len(_dom_totals[kind]) >= _DOM_MAX:
+            domain = "other"
+        _dom_buckets[-1][1][kind][domain] += 1
+        _dom_totals[kind][domain] += 1
+
+
+def _dom_snapshot() -> dict:
+    now_min = int(time.time() // 60)
+    up = max(60.0, time.monotonic() - _started)
+    wins = {}
+    for name, m in (("10m", 10), ("30m", 30), ("60m", 60)):
+        s, x = Counter(), Counter()
+        for mi, d in _dom_buckets:
+            if mi > now_min - m:
+                s.update(d["s"])
+                x.update(d["x"])
+        wins[name] = {"s": dict(s), "x": dict(x), "window_s": int(min(m * 60, up))}
+    return {"totals": {"s": dict(_dom_totals["s"]), "x": dict(_dom_totals["x"])}, "windows": wins}
 
 
 def _record(accepted: int, rejected: int, duplicates: int):
@@ -148,8 +182,10 @@ async def _upload_task(items: list):
         _stats["uploads_success"] += 1
         _stats["items_accepted"] += accepted
         _record(accepted, result.get("rejected_items", 0), result.get("duplicate_items", 0))
+        _dom_record(items, "s")
     else:
         _stats["uploads_failed"] += 1
+        _dom_record(items, "x")
 
 
 async def handle_commit(request: web.Request) -> web.Response:
@@ -187,6 +223,7 @@ async def handle_stats(request: web.Request) -> web.Response:
         "uptime_s": int(time.monotonic() - _started),
         "totals": _totals,
         "rate": _rates(),
+        "domains": _dom_snapshot(),
         "stats": _stats,
         "active_tasks": len(_active_tasks),
     })

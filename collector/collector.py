@@ -5,7 +5,7 @@ import os
 import re
 import sys
 import time
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
@@ -70,12 +70,42 @@ _stats = {
     "foreign_sent": 0, "to_translate": 0, "truncated": 0, "errors": 0, "dropped": 0,
     "to_gpu": 0, "gpu_failed": 0, "rescued_en": 0,
 }
+_dom_buckets: deque = deque()
+_dom_totals = {"r": Counter(), "f": Counter()}
+_DOM_MAX = 1000
 _langs_seen: Counter = Counter()
 _foreign_reasons: Counter = Counter()
 _tr_state = {"ok": False, "fill": 1.0, "installed": frozenset()}
 _session: aiohttp.ClientSession | None = None
 _bg_tasks: set = set()
 _gpu_down_until = 0.0
+
+
+def _dom_record(domain: str, kind: str):
+    domain = (domain or "unknown").strip().lower()[:100] or "unknown"
+    if domain not in _dom_totals["r"] and len(_dom_totals["r"]) >= _DOM_MAX:
+        domain = "other"
+    minute = int(time.time() // 60)
+    if not _dom_buckets or _dom_buckets[-1][0] != minute:
+        _dom_buckets.append((minute, {"r": Counter(), "f": Counter()}))
+        while _dom_buckets and _dom_buckets[0][0] <= minute - 60:
+            _dom_buckets.popleft()
+    _dom_buckets[-1][1][kind][domain] += 1
+    _dom_totals[kind][domain] += 1
+
+
+def _dom_snapshot() -> dict:
+    now_min = int(time.time() // 60)
+    up = max(60.0, time.time() - _started)
+    wins = {}
+    for name, m in (("10m", 10), ("30m", 30), ("60m", 60)):
+        r, f = Counter(), Counter()
+        for mi, d in _dom_buckets:
+            if mi > now_min - m:
+                r.update(d["r"])
+                f.update(d["f"])
+        wins[name] = {"r": dict(r), "f": dict(f), "window_s": int(min(m * 60, up))}
+    return {"totals": {"r": dict(_dom_totals["r"]), "f": dict(_dom_totals["f"])}, "windows": wins}
 
 
 def _norm_lang(lang: str) -> str:
@@ -336,6 +366,7 @@ async def handle_stats(request: web.Request) -> web.Response:
         "upipe": {"up": upipe_data is not None, "queue": (upipe_data or {}).get("queue", 0), "limit": UPIPE_QUEUE_LIMIT, "stats": up_stats},
         "exorde": tx or {"error": "transactioneer unavailable"},
         "collector": _stats,
+        "domains": _dom_snapshot(),
     })
 
 
@@ -345,6 +376,8 @@ async def _process_item(item) -> str:
 
     _stats["received"] += 1
     content = item.get("content", "")
+    domain = item.get("domain", "")
+    _dom_record(domain, "r")
 
     raw_item = dict(item)
     item["author"] = _hash_author(item.get("author", ""))
@@ -409,10 +442,12 @@ async def _process_item(item) -> str:
 
     if gpu_route:
         _forward_gpu(item, raw_item)
+        _dom_record(domain, "f")
         return "to_gpu"
 
     if await forward_to_upipe(item):
         _stats["forwarded"] += 1
+        _dom_record(domain, "f")
         if _stats["forwarded"] % 50 == 0:
             log.info(
                 f"📊 recv={_stats['received']} fwd={_stats['forwarded']} "

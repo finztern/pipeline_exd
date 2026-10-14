@@ -242,3 +242,15 @@ docker compose down -v              # остановить + стереть ке
 - `zs` — прежний zero-shot DeBERTa.
 - Откат: `CLASSIFICATION_BACKEND=zs` в `.env` → `docker compose up -d --force-recreate bpipe` (пересборка не нужна).
 - Лог: `[CLS] backend=... labels=N batch_ms=... classification_ms=...` раз в `CLASSIFICATION_LOG_EVERY` батчей (default 20); `classification_ms` также в строке `⏱ tag`.
+
+---
+
+## Дашборд
+
+```bash
+git pull
+docker compose up -d --build collector transactioneer   # один раз: добавляют метрики по доменам
+./dashboard.sh                                          # q — выход
+```
+
+Клавиши: `0` всё подряд · `1` обзор · `2` домены · `3` переводы и ошибки · `Tab` след. страница · `d` число строк доменов · `+/-` интервал опроса · `r` обновить. Разовый вывод: `./dashboard.sh --once`.
