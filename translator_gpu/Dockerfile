@@ -19,7 +19,7 @@ RUN pip3 install --no-cache-dir \
     "ctranslate2==4.4.0" \
     "aiohttp>=3.9.0"
 
-COPY translator_gpu.py .
+COPY translator_gpu.py tune.py ./
 
 HEALTHCHECK --interval=15s --timeout=5s --retries=120 --start-period=120s \
     CMD curl -sf http://localhost:8004/health || exit 1

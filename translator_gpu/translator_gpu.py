@@ -30,24 +30,47 @@ PORT        = int(os.getenv("GPU_TRANSLATOR_PORT", "8004"))
 UPIPE_URL   = os.getenv("UPIPE_URL", "").strip()
 QUEUE_SIZE  = int(os.getenv("GPU_QUEUE_SIZE", "2000"))
 BATCH_SIZE  = max(1, int(os.getenv("GPU_BATCH_SIZE", "16")))
-BATCH_TIMEOUT = max(0.1, float(os.getenv("GPU_BATCH_TIMEOUT_SECONDS", "10")))
-BEAM        = int(os.getenv("GPU_BEAM_SIZE", "2"))
-MAX_TOKENS  = int(os.getenv("GPU_MAX_TOKENS", "512"))
+MAX_WAIT    = max(0.1, float(os.getenv("GPU_MAX_WAIT_SECONDS", "5")))
+INFLIGHT    = max(1, int(os.getenv("GPU_INFLIGHT", "2")))
+BEAM        = max(1, int(os.getenv("GPU_BEAM_SIZE", "1")))
+MAX_TOKENS  = int(os.getenv("GPU_MAX_TOKENS", "150"))
+DECODE_RATIO = float(os.getenv("GPU_DECODE_RATIO", "2.0"))
+DECODE_PAD  = int(os.getenv("GPU_DECODE_PAD", "16"))
+NLLB_ONLY   = {x.strip().lower() for x in os.getenv("NLLB_ONLY", "").split(",") if x.strip()}
 COMPUTE     = os.getenv("GPU_COMPUTE_TYPE", "int8")
 DEVICE      = os.getenv("GPU_DEVICE", "cuda")
 MODELS_DIR  = os.getenv("CT2_MODELS_DIR", "/models")
 NLLB_NAME   = os.getenv("NLLB_MODEL", "facebook/nllb-200-distilled-600M")
 TARGET      = "eng_Latn"
-OPUS_MODELS = dict(
-    p.strip().split(":", 1)
-    for p in os.getenv(
-        "OPUS_MODELS",
-        "de:Helsinki-NLP/opus-mt-de-en,fr:Helsinki-NLP/opus-mt-fr-en,"
-        "es:Helsinki-NLP/opus-mt-es-en,it:Helsinki-NLP/opus-mt-it-en,"
-        "pt:Helsinki-NLP/opus-mt-ROMANCE-en",
-    ).split(",")
-    if ":" in p
+OPUS_LANGS  = (
+    "af,ar,az,bg,bn,ca,cs,cy,da,de,el,es,et,eu,fi,fr,gl,hi,hu,hy,id,is,it,ja,ka,ko,"
+    "lv,mk,ml,mr,mt,nl,pl,sk,sq,sv,th,tl,tr,uk,ur,vi,zh"
 )
+ROMANCE     = "Helsinki-NLP/opus-mt-ROMANCE-en"
+
+
+GROUPS = {
+    "lt": "bat", "hr": "sla", "sl": "sla", "sr": "sla", "bs": "sla", "no": "gmq", "nb": "gmq", "nn": "gmq",
+    "gu": "inc", "pa": "inc", "ne": "inc", "kn": "dra", "ta": "dra", "te": "dra", "he": "afa",
+    "so": "cus", "sw": "bnt",
+}
+OPUS_FALLBACK = os.getenv("OPUS_FALLBACK", "Helsinki-NLP/opus-mt-mul-en").strip()
+SAMPLE_PATH = os.getenv("GPU_SAMPLE_PATH", "").strip()
+SAMPLE_MAX  = int(os.getenv("GPU_SAMPLE_MAX", "5000"))
+
+
+def _opus_map() -> dict:
+    raw = os.getenv("OPUS_MODELS", "").strip()
+    if raw:
+        return dict(p.strip().split(":", 1) for p in raw.split(",") if ":" in p)
+    langs = (os.getenv("OPUS_LANGS", "").strip() or OPUS_LANGS).split(",")
+    m = {l.strip(): f"Helsinki-NLP/opus-mt-{l.strip()}-en" for l in langs if l.strip()}
+    m.update({l: f"Helsinki-NLP/opus-mt-{g}-en" for l, g in GROUPS.items() if l not in m})
+    m.update(pt=ROMANCE, ro=ROMANCE)
+    return m
+
+
+OPUS_MODELS = _opus_map()
 
 FLORES = {
     "af": "afr_Latn", "ar": "arb_Arab", "bg": "bul_Cyrl", "bn": "ben_Beng", "ca": "cat_Latn",
@@ -65,79 +88,125 @@ FLORES = {
 }
 
 _queue: asyncio.Queue | None = None
-_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ct2")
+_pool = ThreadPoolExecutor(max_workers=INFLIGHT, thread_name_prefix="ct2")
+_bg: set = set()
+_gpu_busy = 0.0
 _session: aiohttp.ClientSession | None = None
 _ready = False
 _init_error = ""
 _started = time.monotonic()
-_opus_by_lang: dict = {}
-_nllb = None
+_backends: dict = {}
+_sample_n = 0
 _lang_counts: Counter = Counter()
 _done_ts: deque = deque()
 RATE_WINDOWS = {"10m": 600, "30m": 1800, "60m": 3600}
 _stats = {
     "received": 0, "translated": 0, "returned": 0, "identical": 0,
     "unsupported": 0, "rejected_busy": 0, "errors": 0, "send_errors": 0,
+    "batches": 0, "batched_items": 0, "too_long": 0,
 }
 
 
 class Backend:
-    def __init__(self, name: str, nllb: bool):
+    def __init__(self, name: str, nllb: bool, compute: str = "", inter: int = 0):
         self.nllb = nllb
         path = os.path.join(MODELS_DIR, name.replace("/", "__"))
         if not os.path.isfile(os.path.join(path, "model.bin")):
             log.info(f"Конвертация {name} -> CT2 int8")
             ctranslate2.converters.TransformersConverter(name).convert(path, quantization="int8", force=True)
-        self.tr = ctranslate2.Translator(path, device=DEVICE, compute_type=COMPUTE)
+        self.tr = ctranslate2.Translator(
+            path, device=DEVICE, compute_type=compute or COMPUTE, inter_threads=inter or INFLIGHT,
+        )
         self.tok = AutoTokenizer.from_pretrained(name)
 
-    def _encode(self, text: str) -> list:
-        ids = self.tok.encode(text, truncation=True, max_length=MAX_TOKENS)
-        return self.tok.convert_ids_to_tokens(ids)
+    def _encode(self, text: str, src: str) -> list:
+        if self.nllb:
+            ids = self.tok.encode(text, add_special_tokens=False, truncation=True, max_length=MAX_TOKENS)
+            toks = [src] + self.tok.convert_ids_to_tokens(ids) + [self.tok.eos_token]
+        else:
+            ids = self.tok.encode(text, truncation=True, max_length=MAX_TOKENS + 1)
+            toks = self.tok.convert_ids_to_tokens(ids)
+        return toks if len(toks) <= MAX_TOKENS else None
+
+    @staticmethod
+    def _chunks(order: list, toks: list):
+        cur = []
+        for i in order:
+            if len(cur) >= BATCH_SIZE:
+                yield cur
+                cur = []
+            cur.append(i)
+        if cur:
+            yield cur
 
     def translate(self, texts: list, srcs: list) -> list:
-        tokens = []
-        for text, src in zip(texts, srcs):
+        toks = [self._encode(t, s) for t, s in zip(texts, srcs)]
+        order = sorted((i for i in range(len(toks)) if toks[i] is not None), key=lambda i: len(toks[i]))
+        out = [None if t is None else "" for t in toks]
+        for chunk in self._chunks(order, toks):
+            batch = [toks[i] for i in chunk]
+            limit = min(MAX_TOKENS, int(len(batch[-1]) * DECODE_RATIO) + DECODE_PAD)
+            kwargs = dict(
+                beam_size=BEAM, max_batch_size=len(batch), max_decoding_length=limit, return_scores=False,
+            )
             if self.nllb:
-                self.tok.src_lang = src
-            tokens.append(self._encode(text))
-        kwargs = dict(beam_size=BEAM, max_batch_size=BATCH_SIZE, max_decoding_length=MAX_TOKENS)
-        if self.nllb:
-            kwargs["target_prefix"] = [[TARGET]] * len(tokens)
-        results = self.tr.translate_batch(tokens, **kwargs)
-        out = []
-        for r in results:
-            hyp = r.hypotheses[0][1:] if self.nllb else r.hypotheses[0]
-            out.append(self.tok.decode(self.tok.convert_tokens_to_ids(hyp), skip_special_tokens=True))
+                kwargs["target_prefix"] = [[TARGET]] * len(batch)
+            results = self.tr.translate_batch(batch, **kwargs)
+            hyps = [r.hypotheses[0][1:] if self.nllb else r.hypotheses[0] for r in results]
+            decoded = self.tok.batch_decode(
+                [self.tok.convert_tokens_to_ids(h) for h in hyps], skip_special_tokens=True,
+            )
+            for i, t in zip(chunk, decoded):
+                out[i] = t
         return out
 
 
+def _candidates(lang: str) -> list:
+    lang = lang.lower()
+    base = lang.split("-")[0]
+    code = FLORES.get(lang) or FLORES.get(base)
+    out = []
+    if lang not in NLLB_ONLY and base not in NLLB_ONLY:
+        if base in OPUS_MODELS:
+            out.append((OPUS_MODELS[base], False, ""))
+        if OPUS_FALLBACK and (code or base in OPUS_MODELS):
+            out.append((OPUS_FALLBACK, False, ""))
+    if code:
+        out.append((NLLB_NAME, True, code))
+    return out
+
+
+def _all_langs() -> set:
+    return set(FLORES) | set(OPUS_MODELS)
+
+
 def _load():
-    global _nllb
-    cache = {}
-    for lang, name in OPUS_MODELS.items():
-        if name not in cache:
-            try:
-                cache[name] = Backend(name, False)
-            except Exception as e:
-                cache[name] = None
-                log.warning(f"Opus {name} не загрузился ({type(e).__name__}: {e}) — {lang} уйдёт на NLLB")
-        if cache[name] is not None:
-            _opus_by_lang[lang] = cache[name]
-    _nllb = Backend(NLLB_NAME, True)
+    names = set(OPUS_MODELS.values())
+    if OPUS_FALLBACK:
+        names.add(OPUS_FALLBACK)
+    for name in sorted(names):
+        try:
+            _backends[name] = Backend(name, False)
+        except Exception as e:
+            log.warning(f"Opus {name} не загрузился ({type(e).__name__}: {e})")
+    need_nllb = False
+    for lang in _all_langs():
+        for name, nllb, _ in _candidates(lang):
+            if _backends.get(name):
+                break
+            if nllb:
+                need_nllb = True
+    if need_nllb:
+        _backends[NLLB_NAME] = Backend(NLLB_NAME, True)
+        log.info("NLLB загружен как запасной/принудительный")
 
 
 def _route(lang: str):
-    lang = lang.lower()
-    base = lang.split("-")[0]
-    if base in _opus_by_lang and lang not in ("zh-cn", "zh-tw"):
-        return _opus_by_lang[base], ""
-    code = FLORES.get(lang) or FLORES.get(base)
-    return (_nllb, code) if code else None
-
-
-def _run_group(backend: Backend, texts: list, srcs: list) -> list:
-    return backend.translate(texts, srcs)
+    for name, _, code in _candidates(lang):
+        be = _backends.get(name)
+        if be:
+            return be, code
+    return None
 
 
 async def _send_back(item: dict, text: str):
@@ -179,60 +248,98 @@ def _rates() -> dict:
 
 
 async def _process_batch(loop, backend: Backend, items: list):
-    items.sort(key=lambda j: len(j[0]["content"]))
+    global _gpu_busy
     texts = [j[0]["content"] for j in items]
     srcs = [j[2] for j in items]
+    t0 = time.monotonic()
     try:
-        outs = await loop.run_in_executor(_pool, _run_group, backend, texts, srcs)
+        outs = await loop.run_in_executor(_pool, backend.translate, texts, srcs)
     except Exception as e:
         _stats["errors"] += len(items)
         log.error(f"Ошибка перевода батча: {e}", exc_info=True)
         return
+    dt = time.monotonic() - t0
+    _gpu_busy += dt
+    _stats["batches"] += 1
+    _stats["batched_items"] += len(items)
 
-    sends = []
+    sent = 0
     for (item, _, _), out in zip(items, outs):
+        if out is None:
+            _stats["too_long"] += 1
+            continue
         out = out.strip()
         if not out or out == item["content"].strip():
             _stats["identical"] += 1
             continue
         _stats["translated"] += 1
         _lang_counts[str(item.get("detected_lang", "")).lower()] += 1
-        sends.append(_send_back(item, out))
-    _record_done(len(sends))
-    await asyncio.gather(*sends)
-    log.info(f"batch={len(items)} переведено={len(sends)} | {_stats}")
+        task = asyncio.create_task(_send_back(item, out))
+        _bg.add(task)
+        task.add_done_callback(_bg.discard)
+        sent += 1
+    _record_done(sent)
+    log.info(f"batch={len(items)} ok={sent} {dt:.2f}s ({len(items) / max(dt, 1e-3):.1f}/s) q={_queue.qsize()}")
 
 
 async def _worker():
     loop = asyncio.get_running_loop()
+    slots = asyncio.Semaphore(INFLIGHT)
     buckets: dict = {}
-    while True:
-        try:
-            if buckets:
-                nearest = min(b["deadline"] for b in buckets.values())
-                timeout = max(0.0, nearest - loop.time())
-            else:
-                timeout = None
-            try:
-                job = await asyncio.wait_for(_queue.get(), timeout)
-                key = id(job[1])
-                bucket = buckets.get(key)
-                if bucket is None:
-                    bucket = buckets[key] = {
-                        "backend": job[1], "items": [], "deadline": loop.time() + BATCH_TIMEOUT,
-                    }
-                bucket["items"].append(job)
-            except asyncio.TimeoutError:
-                pass
 
-            now = loop.time()
-            ready = [k for k, b in buckets.items() if len(b["items"]) >= BATCH_SIZE or b["deadline"] <= now]
-            for k in ready:
-                b = buckets.pop(k)
-                await _process_batch(loop, b["backend"], b["items"])
+    def add(job):
+        b = buckets.get(id(job[1]))
+        if b is None:
+            b = buckets[id(job[1])] = {"backend": job[1], "items": [], "t0": loop.time()}
+        b["items"].append(job)
+
+    def drain():
+        while True:
+            try:
+                add(_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                return
+
+    while True:
+        held = False
+        try:
+            if not buckets:
+                add(await _queue.get())
+            await slots.acquire()
+            held = True
+            drain()
+            oldest = min(buckets.values(), key=lambda b: b["t0"])
+            if loop.time() - oldest["t0"] >= MAX_WAIT:
+                pick = oldest
+            else:
+                pick = max(buckets.values(), key=lambda b: len(b["items"]))
+            del buckets[id(pick["backend"])]
+            items = pick["items"]
+            if len(items) > BATCH_SIZE:
+                buckets[id(pick["backend"])] = {
+                    "backend": pick["backend"], "items": items[BATCH_SIZE:], "t0": pick["t0"],
+                }
+                items = items[:BATCH_SIZE]
+            task = loop.create_task(_process_batch(loop, pick["backend"], items))
+            task.add_done_callback(lambda _t: slots.release())
+            held = False
         except Exception as e:
+            if held:
+                slots.release()
             log.error(f"Воркер: {e}", exc_info=True)
             await asyncio.sleep(1)
+
+
+def _save_sample(lang: str, text: str):
+    global _sample_n
+    if not SAMPLE_PATH or _sample_n >= SAMPLE_MAX:
+        return
+    try:
+        with open(SAMPLE_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"detected_lang": lang, "content": text}, ensure_ascii=False) + "\n")
+        _sample_n += 1
+    except OSError:
+        pass
 
 
 async def handle_translate(request: web.Request) -> web.Response:
@@ -255,6 +362,7 @@ async def handle_translate(request: web.Request) -> web.Response:
         return web.json_response({"error": "queue_full"}, status=503)
 
     _stats["received"] += 1
+    _save_sample(lang, item["content"])
     _queue.put_nowait((item, route[0], route[1]))
     return web.Response(status=202, text="accepted")
 
@@ -265,7 +373,8 @@ async def handle_health(request: web.Request) -> web.Response:
         "ready": _ready,
         "queue": _queue.qsize() if _queue else 0,
         "max": QUEUE_SIZE,
-        "opus": sorted(_opus_by_lang),
+        "opus": sorted(l for l, n in OPUS_MODELS.items() if _backends.get(n)),
+        "models": len([b for b in _backends.values() if b]),
         "init_error": _init_error or None,
     }, status=200 if _ready else 503)
 
@@ -275,7 +384,12 @@ async def handle_stats(request: web.Request) -> web.Response:
         "uptime_s": int(time.monotonic() - _started),
         "queue": _queue.qsize() if _queue else 0,
         "batch_size": BATCH_SIZE,
-        "batch_timeout_s": BATCH_TIMEOUT,
+        "max_tokens": MAX_TOKENS,
+        "inflight": INFLIGHT,
+        "beam": BEAM,
+        "compute": COMPUTE,
+        "avg_batch": round(_stats["batched_items"] / max(1, _stats["batches"]), 1),
+        "gpu_busy_pct": round(100 * _gpu_busy / max(1.0, time.monotonic() - _started), 1),
         "rate_per_sec": _rates(),
         "stats": _stats,
         "languages": dict(_lang_counts),
@@ -283,9 +397,12 @@ async def handle_stats(request: web.Request) -> web.Response:
 
 
 async def _init():
-    global _ready, _init_error, _session, _queue
+    global _ready, _init_error, _session, _queue, _sample_n
     loop = asyncio.get_running_loop()
     _queue = asyncio.Queue(maxsize=QUEUE_SIZE)
+    if SAMPLE_PATH and os.path.isfile(SAMPLE_PATH):
+        with open(SAMPLE_PATH, encoding="utf-8") as f:
+            _sample_n = sum(1 for _ in f)
     _session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=20, keepalive_timeout=60))
     try:
         await loop.run_in_executor(None, _load)
@@ -295,7 +412,10 @@ async def _init():
         return
     asyncio.create_task(_worker())
     _ready = True
-    log.info(f"Готов | opus={sorted(_opus_by_lang)} nllb={NLLB_NAME} device={DEVICE}/{COMPUTE} -> {UPIPE_URL}")
+    log.info(
+        f"Готов | models={len([b for b in _backends.values() if b])} nllb={"да" if _backends.get(NLLB_NAME) else "нет"} device={DEVICE}/{COMPUTE} "
+        f"beam={BEAM} batch={BATCH_SIZE} max_tokens={MAX_TOKENS} inflight={INFLIGHT} -> {UPIPE_URL}"
+    )
 
 
 async def on_startup(app: web.Application):
