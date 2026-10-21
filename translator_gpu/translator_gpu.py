@@ -381,6 +381,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 async def handle_stats(request: web.Request) -> web.Response:
     return web.json_response({
+        "languages_count": len(_lang_counts),
         "uptime_s": int(time.monotonic() - _started),
         "queue": _queue.qsize() if _queue else 0,
         "batch_size": BATCH_SIZE,
@@ -392,7 +393,7 @@ async def handle_stats(request: web.Request) -> web.Response:
         "gpu_busy_pct": round(100 * _gpu_busy / max(1.0, time.monotonic() - _started), 1),
         "rate_per_sec": _rates(),
         "stats": _stats,
-        "languages": dict(_lang_counts),
+        "languages": dict(_lang_counts.most_common()),
     })
 
 
