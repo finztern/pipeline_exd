@@ -50,6 +50,13 @@ GPU_TRANSLATOR_URL  = os.getenv("GPU_TRANSLATOR_URL", "").strip()
 GPU_ROUTE_REASONS   = {r.strip() for r in os.getenv("GPU_ROUTE_REASONS", "queue_full").split(",") if r.strip()}
 GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "30"))
 
+URL_DEDUP_MODE      = os.getenv("URL_DEDUP_MODE", "shadow").strip().lower()
+URL_DEDUP_API       = os.getenv("URL_DEDUP_API", "https://url-check.exorde.network").rstrip("/")
+URL_DEDUP_BATCH     = int(os.getenv("URL_DEDUP_BATCH", "100"))
+URL_DEDUP_FLUSH_SEC = float(os.getenv("URL_DEDUP_FLUSH_SECONDS", "2.0"))
+URL_DEDUP_TIMEOUT   = float(os.getenv("URL_DEDUP_TIMEOUT_SECONDS", "10"))
+URL_DEDUP_QUEUE_MAX = int(os.getenv("URL_DEDUP_QUEUE_MAX", "5000"))
+
 LANG_ALIASES = {"zh-cn": "zh", "zh-tw": "zt", "no": "nb"}
 
 # Слова, не пересекающиеся с de/nl/af/da/no/sv/romance — langdetect часто принимает короткий en за cy/af/so/tl/nl и т.п.
@@ -79,6 +86,13 @@ _tr_state = {"ok": False, "fill": 1.0, "installed": frozenset()}
 _session: aiohttp.ClientSession | None = None
 _bg_tasks: set = set()
 _gpu_down_until = 0.0
+
+_url_q: deque = deque()
+_url_stats = {
+    "queued": 0, "checked": 0, "duplicates": 0, "invalid": 0,
+    "requests": 0, "errors": 0, "overflow": 0, "total_ms": 0.0, "last_ms": 0.0,
+    "sample": None, "last_error": None,
+}
 
 
 def _dom_record(domain: str, kind: str):
@@ -370,6 +384,93 @@ async def handle_stats(request: web.Request) -> web.Response:
     })
 
 
+def _cnt(v) -> int:
+    if isinstance(v, (list, tuple, set, dict)):
+        return len(v)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _url_dedup_enqueue(url):
+    if URL_DEDUP_MODE != "shadow" or not isinstance(url, str) or not url:
+        return
+    if len(_url_q) >= URL_DEDUP_QUEUE_MAX:
+        _url_stats["overflow"] += 1
+        return
+    _url_q.append(url)
+    _url_stats["queued"] += 1
+
+
+async def _url_dedup_flush(urls: list):
+    t0 = time.monotonic()
+    try:
+        async with _session.post(
+            f"{URL_DEDUP_API}/v1/detailed-check",
+            data=orjson.dumps({"urls": urls}),
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=URL_DEDUP_TIMEOUT),
+        ) as resp:
+            body = await resp.read()
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status}: {body[:200]!r}")
+            data = orjson.loads(body)
+    except Exception as e:
+        _url_stats["errors"] += 1
+        _url_stats["last_error"] = str(e)[:200]
+        return
+    ms = (time.monotonic() - t0) * 1000
+    _url_stats["requests"] += 1
+    _url_stats["total_ms"] += ms
+    _url_stats["last_ms"] = round(ms, 1)
+    _url_stats["checked"] += len(urls)
+    _url_stats["duplicates"] += _cnt(data.get("duplicates_found"))
+    _url_stats["invalid"] += _cnt(data.get("invalid_urls"))
+    if _url_stats["sample"] is None:
+        _url_stats["sample"] = body[:600].decode("utf-8", "replace")
+    if _url_stats["requests"] % 20 == 1:
+        log.info(
+            f"🔎 url-dedup shadow: checked={_url_stats['checked']} dup={_url_stats['duplicates']} "
+            f"invalid={_url_stats['invalid']} last={ms:.0f}ms"
+        )
+
+
+async def _url_dedup_loop():
+    last = time.monotonic()
+    while True:
+        await asyncio.sleep(0.5)
+        if not _url_q:
+            last = time.monotonic()
+            continue
+        if len(_url_q) < URL_DEDUP_BATCH and time.monotonic() - last < URL_DEDUP_FLUSH_SEC:
+            continue
+        urls = [_url_q.popleft() for _ in range(min(URL_DEDUP_BATCH, len(_url_q)))]
+        last = time.monotonic()
+        await _url_dedup_flush(urls)
+
+
+def _url_dedup_snapshot() -> dict:
+    st = _url_stats
+    checked, reqs = st["checked"], st["requests"]
+    return {
+        "mode": URL_DEDUP_MODE,
+        "queue": len(_url_q),
+        "queued": st["queued"],
+        "checked": checked,
+        "duplicates": st["duplicates"],
+        "invalid": st["invalid"],
+        "hit_rate": round(st["duplicates"] / checked, 4) if checked else None,
+        "requests": reqs,
+        "errors": st["errors"],
+        "overflow": st["overflow"],
+        "avg_ms": round(st["total_ms"] / reqs, 1) if reqs else None,
+        "last_ms": st["last_ms"],
+        "last_error": st["last_error"],
+        "sample": st["sample"],
+    }
+
+
 async def _process_item(item) -> str:
     if not isinstance(item, dict) or not isinstance(item.get("content", ""), str):
         return "invalid_item"
@@ -440,6 +541,8 @@ async def _process_item(item) -> str:
     else:
         log.warning(f"⚠️ Не удалось распарсить created_at: {created_at_str!r}")
 
+    _url_dedup_enqueue(item.get("url"))
+
     if gpu_route:
         _forward_gpu(item, raw_item)
         _dom_record(domain, "f")
@@ -499,6 +602,7 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "ok",
         "stats": _stats,
+        "url_dedup": _url_dedup_snapshot(),
         "upipe": UPIPE_URL,
         "lang_filter": LANG_FILTER or None,
         "translate": TRANSLATE,
@@ -520,9 +624,12 @@ async def on_startup(app: web.Application):
     _session = aiohttp.ClientSession(connector=connector)
     if TRANSLATE:
         app["poller"] = asyncio.create_task(_poll_translator())
+    if URL_DEDUP_MODE == "shadow":
+        app["url_dedup"] = asyncio.create_task(_url_dedup_loop())
     log.info(f"🚀 Collector запущен на порту {COLLECTOR_PORT}")
     log.info(f"   Пересылает в upipe: {UPIPE_URL}")
     log.info(f"   Опрос очередей bpipe: {BPIPE_URLS}")
+    log.info(f"   URL dedup: {URL_DEDUP_MODE} api={URL_DEDUP_API} batch={URL_DEDUP_BATCH}")
     log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
     log.info(f"   TRANSLATE={TRANSLATE} translator={TRANSLATOR_URL if TRANSLATE else '-'}")
     log.info(f"   GPU translator: {GPU_TRANSLATOR_URL or 'выключен'} (причины: {sorted(GPU_ROUTE_REASONS)})")
@@ -534,6 +641,8 @@ async def on_shutdown(app: web.Application):
     global _session
     if "poller" in app:
         app["poller"].cancel()
+    if "url_dedup" in app:
+        app["url_dedup"].cancel()
     if _session:
         await _session.close()
     log.info(f"📊 Итог: {_stats}")
