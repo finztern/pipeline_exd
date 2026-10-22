@@ -19,6 +19,14 @@ logging.basicConfig(level=logging.INFO)
 
 _cpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tag_cpu")
 
+SENTIMENT_WEIGHTS = (
+    (0.6, (0.30, 0.10, 0.60)),
+    (0.4, (0.40, 0.20, 0.40)),
+    (0.1, (0.60, 0.25, 0.15)),
+    (0.0, (0.60, 0.40, 0.00)),
+)
+
+
 def clear_gpu_memory():
     try:
         if torch.cuda.is_available():
@@ -68,9 +76,21 @@ def classify_cosine(model, text_embeddings, labels):
     label_emb = _label_embeddings(model, labels)
     sims = _normalize(np.asarray(text_embeddings, dtype=np.float32)) @ label_emb.T
     best = sims.argmax(axis=1)
-    # score = (cos + 1) / 2, clip в [0, 1]
     scores = np.clip((sims[np.arange(len(best)), best] + 1.0) / 2.0, 0.0, 1.0)
     return [{"labels": [labels[int(b)]], "scores": [float(sc)]} for b, sc in zip(best, scores)]
+
+
+def _pos_minus_neg(prediction):
+    d = {str(e["label"]).lower(): float(e["score"]) for e in prediction}
+    return round(d.get("positive", 0.0) - d.get("negative", 0.0), 3)
+
+
+def ensemble_sentiment(gdb, vader, fin):
+    a = abs(fin)
+    for threshold, (wg, wv, wf) in SENTIMENT_WEIGHTS:
+        if a >= threshold:
+            return round(max(-1.0, min(1.0, wg * gdb + wv * vader + wf * fin)), 2)
+    return 0.0
 
 
 def tag(documents: list[str], lab_configuration):
@@ -102,6 +122,7 @@ def tag(documents: list[str], lab_configuration):
     classification_labels = list(lab_configuration["labeldict"].keys())
     sentiment_analyzer = models['sentiment_analyzer']
     fdb_pipe = models['fdb_pipe']
+    gdb_pipe = models['gdb_pipe']
 
     text_classification_models = {
         "Emotion": models['Emotion'],
@@ -141,7 +162,6 @@ def tag(documents: list[str], lab_configuration):
         if backend == "minilm_cosine":
             classification_results = classify_cosine(model, embedding_vectors, classification_labels)
         else:
-            # truncation/max_length kwargs в ZeroShot-пайплайне ломаются в части версий transformers
             classification_results = zs_pipe(documents, candidate_labels=classification_labels, batch_size=zs_batch_size)
         lap("cls")
         classification_ms = timings.pop("cls") * 1000
@@ -157,6 +177,9 @@ def tag(documents: list[str], lab_configuration):
 
         fdb_predictions = fdb_pipe(documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
         lap("fdb")
+
+        gdb_predictions = gdb_pipe(documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
+        lap("gdb")
 
         vader_scores, finvader_scores = cpu_future.result()
         lap("cpu_wait")
@@ -241,16 +264,11 @@ def tag(documents: list[str], lab_configuration):
             fdb_sentiment_dict = {e["label"]: round(e["score"], 3) for e in fdb_prediction}
             fdb_sent_score = round(fdb_sentiment_dict.get("positive", 0.0) - fdb_sentiment_dict.get("negative", 0.0), 3)
 
+            gdb_sent_score = _pos_minus_neg(gdb_predictions[idx])
+
             compounded_fin_sentiment = round((0.70 * fdb_sent_score + 0.30 * fin_vader_sent_score), 2)
 
-            if abs(compounded_fin_sentiment) >= 0.6:
-                sentiment_score = round((0.15 * vader_sent_score + 0.85 * compounded_fin_sentiment), 2)
-            elif abs(compounded_fin_sentiment) >= 0.4:
-                sentiment_score = round((0.35 * vader_sent_score + 0.65 * compounded_fin_sentiment), 2)
-            elif abs(compounded_fin_sentiment) >= 0.1:
-                sentiment_score = round((0.60 * vader_sent_score + 0.40 * compounded_fin_sentiment), 2)
-            else:
-                sentiment_score = round((0.50 * vader_sent_score + 0.50 * fin_vader_sent_score), 2)
+            sentiment_score = ensemble_sentiment(gdb_sent_score, vader_sent_score, compounded_fin_sentiment)
 
             sentiment = Sentiment(sentiment_score)
 
@@ -309,7 +327,7 @@ def tag(documents: list[str], lab_configuration):
 
 def create_fallback_analysis():
     return Analysis(
-        classification=Classification(label="other", score=0.5),
+        classification=Classification(label="Social", score=0.5),
         language_score=LanguageScore(1.0),
         sentiment=Sentiment(0.0),
         embedding=Embedding([0.0] * 384),

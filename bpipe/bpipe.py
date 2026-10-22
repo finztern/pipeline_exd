@@ -1,12 +1,9 @@
 """
 Bpipe (standalone) — принимает обработанные элементы от upipe,
-запускает ML-пайплайн (эмбеддинги, сентимент, эмоции, тип текста, etc.),
-формирует батчи и отправляет в transactioneer.
+запускает ML-пайплайн, формирует батчи и отправляет в transactioneer.
 
 Слушает: POST / на BPIPE_PORT (по умолчанию 7995)
 Отправляет в: TRANSACTIONEER_URL (по умолчанию http://127.0.0.1:8002/commit)
-
-Адаптировано для локального запуска на RTX 3050 8GB.
 """
 import asyncio
 import gc
@@ -50,10 +47,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── Конфигурация ─────────────────────────────────────────────
 BPIPE_PORT           = int(os.getenv("BPIPE_PORT", "7995"))
 TRANSACTIONEER_URL   = os.getenv("TRANSACTIONEER_URL", "http://127.0.0.1:8002")
-FIXED_BATCH_SIZE     = int(os.getenv("FIXED_BATCH_SIZE", "6"))     # Меньше для RTX 3050
+FIXED_BATCH_SIZE     = int(os.getenv("FIXED_BATCH_SIZE", "6"))
 BATCH_TIMEOUT_SECS   = float(os.getenv("BATCH_TIMEOUT_SECONDS", "3.0"))
 
 QUEUE_TRANSLATED_MAX      = int(os.getenv("BPIPE_QUEUE_TRANSLATED_MAX", "100"))
@@ -63,7 +59,6 @@ QUEUE_BUFFER_MAX          = int(os.getenv("BPIPE_QUEUE_BUFFER_MAX", "500"))
 BUFFER_TTL_SECS           = float(os.getenv("BPIPE_BUFFER_TTL_SECONDS", "7200"))
 BUFFER_DOMAINS            = [d.strip().lower() for d in os.getenv("BPIPE_BUFFER_DOMAINS", "").split(",") if d.strip()]
 
-# ─── Глобальное состояние ──────────────────────────────────────
 _q_translated: deque = deque()
 _q_default: deque = deque()
 _q_buffer: deque = deque()
@@ -92,8 +87,6 @@ _stats = {
 class TooBigError(Exception):
     pass
 
-
-# ─── Отправка в transactioneer ─────────────────────────────────
 
 async def send_batch_to_transactioneer(processed_batch: dict):
     global _session, _stats
@@ -132,14 +125,9 @@ async def send_batch_to_transactioneer(processed_batch: dict):
         _stats["errors"] += 1
 
 
-# ─── Обработка батча (в отдельном потоке) ─────────────────────
-
 def _process_batch_sync(batch, lab_config: dict) -> dict:
-    """Синхронная ML-обработка батча. Запускается в ThreadPoolExecutor."""
     return process_batch(batch, lab_config)
 
-
-# ─── Приоритетные очереди ─────────────────────────────────────
 
 def _domain_is_buffer(domain: str) -> bool:
     domain = (domain or "").strip().lower()
@@ -217,8 +205,6 @@ def _enqueue(kind: str, entry) -> bool:
     return True
 
 
-# ─── Основной цикл формирования батчей ────────────────────────
-
 async def batch_processing_loop():
     global _stats, _inflight
 
@@ -263,7 +249,6 @@ async def batch_processing_loop():
         batch_id += 1
         log.info(f"[Batch-{batch_id}] Обрабатываем {len(batch)} элементов...")
 
-        # ML обработка в потоке (GPU)
         t0 = timerit()
         try:
             processed_batch = await loop.run_in_executor(
@@ -288,8 +273,6 @@ async def batch_processing_loop():
             _inflight = 0
 
 
-# ─── HTTP обработчики ──────────────────────────────────────────
-
 async def handle_receive_item(request: web.Request) -> web.Response:
     global _stats, _live_config
     try:
@@ -297,7 +280,6 @@ async def handle_receive_item(request: web.Request) -> web.Response:
     except Exception as e:
         return web.Response(text=f"bad json: {e}", status=400)
 
-    # Проверяем наличие translation
     translation_text = raw_item.get("translation", {}).get("translation", "")
     if not translation_text or not translation_text.strip():
         return web.Response(text="skipped_empty")
@@ -333,6 +315,12 @@ async def handle_receive_item(request: web.Request) -> web.Response:
             processed_item.item["external_parent_id"] = ExternalParentId(ext_parent_id)
         if raw_item["item"].get("username"):
             processed_item.item["username"] = Username(raw_item["item"]["username"])
+        if raw_item["item"].get("userprofile_url"):
+            processed_item.item["userprofile_url"] = UserProfileUrl(raw_item["item"]["userprofile_url"])
+        if raw_item["item"].get("summary"):
+            processed_item.item["summary"] = raw_item["item"]["summary"]
+        if raw_item["item"].get("picture"):
+            processed_item.item["picture"] = raw_item["item"]["picture"]
 
     except Exception as e:
         log.warning(f"Ошибка создания Processed: {e}")
@@ -397,7 +385,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def handle_queue(request: web.Request) -> web.Response:
-    # queue/max/fill = translated+default (контракт для collector); buffer — только в "queues"
+    # queue/max/fill = translated+default (контракт collector); buffer — только в "queues"
     size = len(_q_translated) + len(_q_default)
     mx = QUEUE_TRANSLATED_MAX + QUEUE_DEFAULT_MAX
     return web.json_response({
@@ -421,7 +409,6 @@ async def on_startup(app: web.Application):
 
     loop = asyncio.get_event_loop()
 
-    # Инициализация ML моделей
     try:
         _lab_config = await loop.run_in_executor(None, lab_initialization)
         log.info("✅ ML модели загружены")
@@ -429,7 +416,6 @@ async def on_startup(app: web.Application):
         log.error(f"❌ Ошибка загрузки моделей: {e}")
         raise
 
-    # Live конфиг (категории/метки) от Exorde
     try:
         _live_config = await get_live_configuration()
         _lab_config["live_configuration"] = _live_config
@@ -442,7 +428,6 @@ async def on_startup(app: web.Application):
     connector = aiohttp.TCPConnector(limit=5, keepalive_timeout=60)
     _session = aiohttp.ClientSession(connector=connector)
 
-    # Запускаем основной цикл
     asyncio.create_task(batch_processing_loop())
 
     log.info(f"✅ Bpipe запущен на порту {BPIPE_PORT}")

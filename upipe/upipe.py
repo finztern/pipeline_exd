@@ -43,6 +43,8 @@ GPU_TRANSLATOR_URL  = os.getenv("GPU_TRANSLATOR_URL", "").strip()
 GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "30"))
 TRANSLATED_RETRIES  = max(1, int(os.getenv("UPIPE_TRANSLATED_RETRIES", "6")))
 
+PASSTHROUGH_FIELDS = ("username", "summary", "userprofile_url")
+
 def _parse_bpipe_urls() -> list[str]:
     urls_env = os.getenv("BPIPE_URLS", "")
     if urls_env:
@@ -93,6 +95,16 @@ def _process_sync(item: Item, lab_config: dict, translation: Translation | None 
             "score": float(processed.classification.score),
         },
     }
+
+
+def _copy_passthrough(payload_item: dict, raw_item: dict):
+    for k in PASSTHROUGH_FIELDS:
+        v = raw_item.get(k)
+        if isinstance(v, str) and v:
+            payload_item[k] = v
+    pic = raw_item.get("picture")
+    if isinstance(pic, str) and pic.startswith(("http://", "https://")):
+        payload_item["picture"] = pic
 
 
 async def forward_to_bpipe(payload: dict) -> bool:
@@ -257,10 +269,7 @@ async def worker_loop(worker_id: int):
                 )
                 _stats["processed"] += 1
 
-                if raw_item.get("username"):
-                    payload["item"]["username"] = raw_item["username"]
-                if raw_item.get("summary"):
-                    payload["item"]["summary"] = raw_item["summary"]
+                _copy_passthrough(payload["item"], raw_item)
                 if pre:
                     payload["translated"] = True
                 prio = raw_item.get("priority") or raw_item.get("queue")

@@ -1,34 +1,22 @@
-import json
 import os
 import gc
+import json
 import logging
-import requests
 import torch
 from transformers import AutoTokenizer, pipeline
 
-# onnxruntime-gpu (>=1.19) требует cuDNN 9.x, но не находит его сам по
-# умолчанию, если он установлен как pip-пакет (nvidia-cudnn-cu12), а не
-# как системная библиотека — .so лежит внутри site-packages, вне
-# стандартных путей динамического линковщика. preload_dlls() явно находит
-# и подгружает эти .so ДО создания любой ORT-сессии на GPU. Без этого
-# CUDAExecutionProvider тихо отсутствует в available_providers, и всё
-# молча уезжает на CPU (см. bpipe.py при старте — там это фатальная
-# ошибка, ValueError, а не тихий фолбэк).
 import onnxruntime
 try:
     onnxruntime.preload_dlls()
-    logging.info("[ORT] preload_dlls() выполнен — CUDA/cuDNN библиотеки из site-packages подгружены")
+    logging.info("[ORT] preload_dlls() выполнен")
 except Exception as e:
-    logging.warning(f"[ORT] preload_dlls() недоступен/не сработал ({e}) — "
-                     f"полагаемся на LD_LIBRARY_PATH из Dockerfile")
+    logging.warning(f"[ORT] preload_dlls() недоступен/не сработал ({e}) — полагаемся на LD_LIBRARY_PATH из Dockerfile")
 
 try:
     logging.info(f"[ORT] Version: {onnxruntime.__version__}")
-    logging.info(f"[ORT] Build info: {onnxruntime.get_build_info() if hasattr(onnxruntime, 'get_build_info') else 'n/a'}")
     logging.info(f"[ORT] Available providers ДО загрузки моделей: {onnxruntime.get_available_providers()}")
-    onnxruntime.print_debug_info()
 except Exception as e:
-    logging.warning(f"[ORT] print_debug_info() упал: {e}")
+    logging.warning(f"[ORT] диагностика упала: {e}")
 
 from transformers import AutoModelForSequenceClassification
 from sentence_transformers import SentenceTransformer
@@ -41,6 +29,11 @@ CLASSIFICATION_BACKEND = os.getenv("CLASSIFICATION_BACKEND", "minilm_cosine").st
 if CLASSIFICATION_BACKEND not in ("zs", "minilm_cosine"):
     raise ValueError(f"CLASSIFICATION_BACKEND должен быть zs|minilm_cosine, получено: {CLASSIFICATION_BACKEND!r}")
 
+CLASSIFICATION_LABELS = [
+    "Business", "People", "Investing", "Health", "Law", "Economy", "Technology", "Sports",
+    "Cryptocurrency", "Environment", "Politics", "Finance", "Science", "Entertainment", "Social",
+]
+
 
 def clear_gpu_memory():
     try:
@@ -51,6 +44,23 @@ def clear_gpu_memory():
         logging.debug("GPU memory cleared")
     except Exception as e:
         logging.warning(f"Error clearing GPU memory: {e}")
+
+
+def _load_text_pipeline(model_id, dtype, device):
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if not tokenizer.model_max_length or tokenizer.model_max_length > 100_000:
+        tokenizer.model_max_length = 512
+    model = AutoModelForSequenceClassification.from_pretrained(model_id, torch_dtype=dtype)
+    return pipeline(
+        "text-classification",
+        model=model,
+        tokenizer=tokenizer,
+        top_k=None,
+        max_length=512,
+        padding=True,
+        truncation=True,
+        device=device,
+    )
 
 
 def initialize_models(device):
@@ -68,7 +78,6 @@ def initialize_models(device):
 
     models = {}
 
-    # ── Sentence Transformer (ONNX backend — у него ЕСТЬ готовый .onnx) ───────
     logging.info("[TAGGING] Loading: sentence-transformers/all-MiniLM-L6-v2 (ONNX)")
     models["sentence_transformer"] = SentenceTransformer(
         "sentence-transformers/all-MiniLM-L6-v2",
@@ -78,7 +87,6 @@ def initialize_models(device):
     clear_gpu_memory()
 
     torch_device = device
-
     _dtype = torch.float16 if device >= 0 else None
 
     if CLASSIFICATION_BACKEND == "zs":
@@ -122,23 +130,9 @@ def initialize_models(device):
                 revision=SNAPSHOT_REVISIONS[model_name],
             )
 
-        _tokenizer = AutoTokenizer.from_pretrained(source_id)
-        if not _tokenizer.model_max_length or _tokenizer.model_max_length > 100_000:
-            _tokenizer.model_max_length = 512
-        _model = AutoModelForSequenceClassification.from_pretrained(source_id, torch_dtype=_dtype)
-        models[col_name] = pipeline(
-            "text-classification",
-            model=_model,
-            tokenizer=_tokenizer,
-            top_k=None,
-            max_length=512,
-            padding=True,
-            truncation=True,
-            device=torch_device,
-        )
+        models[col_name] = _load_text_pipeline(source_id, _dtype, torch_device)
         clear_gpu_memory()
 
-    # ── VADER & FinVADER (CPU, нет ONNX версии) ───────────────────────────────
     logging.info("[TAGGING] Loading: vaderSentiment")
     models["sentiment_analyzer"] = SentimentIntensityAnalyzer()
     logging.info("[TAGGING] Loading: finvader")
@@ -163,32 +157,17 @@ def initialize_models(device):
     except Exception as e:
         logging.warning(f"[TAGGING] Lexicon load failed (продолжаем без них): {e}")
 
-    # ── Financial DistilRoBERTa (обычный PyTorch) ─────────────────────────────
     logging.info("[TAGGING] Loading: mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis")
-    _fdb_id = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
-    _fdb_tokenizer = AutoTokenizer.from_pretrained(_fdb_id)
-    if not _fdb_tokenizer.model_max_length or _fdb_tokenizer.model_max_length > 100_000:
-        _fdb_tokenizer.model_max_length = 512
-    _fdb_model = AutoModelForSequenceClassification.from_pretrained(_fdb_id, torch_dtype=_dtype)
-    models["fdb_pipe"] = pipeline(
-        "text-classification",
-        model=_fdb_model,
-        tokenizer=_fdb_tokenizer,
-        top_k=None,
-        max_length=512,
-        padding=True,
-        truncation=True,
-        device=torch_device,
+    models["fdb_pipe"] = _load_text_pipeline(
+        "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis", _dtype, torch_device
     )
     clear_gpu_memory()
 
-    # gdb_pipe (lxyuan/distilbert-base-multilingual-cased-sentiments-student) убран:
-    # это multilingual-модель (крупный multilingual vocab/embedding-слой ⇒ больше VRAM,
-    # чем у обычной англоязычной), а на вход в bpipe попадает ТОЛЬКО en-контент —
-    # он дважды отфильтрован по языку раньше по пайплайну (collector: LANG_FILTER=en,
-    # upipe/translate.py: NonEnglishError на всём не-en). Многоязычность модели
-    # здесь просто не используется, а VRAM под неё резервируется на каждую реплику.
-    # Сентимент по-прежнему считается из fdb_pipe + vaderSentiment + finvader (см. tag.py).
+    logging.info("[TAGGING] Loading: lxyuan/distilbert-base-multilingual-cased-sentiments-student")
+    models["gdb_pipe"] = _load_text_pipeline(
+        "lxyuan/distilbert-base-multilingual-cased-sentiments-student", _dtype, torch_device
+    )
+    clear_gpu_memory()
 
     logging.info("[TAGGING] Все модели загружены.")
 
@@ -222,26 +201,8 @@ def lab_initialization():
 
     models = initialize_models(device)
 
-    try:
-        USE_PROXY = os.getenv("USE_PROXY", "false").lower() == "true"
-        PROXY_URL = os.getenv("PROXY_URL", "")
-        proxies = {"http": PROXY_URL, "https": PROXY_URL} if (USE_PROXY and PROXY_URL) else None
-        labels = requests.get(
-            "https://raw.githubusercontent.com/exorde-labs/TestnetProtocol/main/targets/class_names.json",
-            proxies=proxies,
-            timeout=30,
-        ).json()
-        logging.info("[LAB INIT] Classification labels loaded.")
-        logging.info(
-            f"[LAB INIT] Classification labels count: {len(labels)}, backend={CLASSIFICATION_BACKEND}"
-        )
-        if CLASSIFICATION_BACKEND == "zs":
-            logging.info(f"[LAB INIT] zs_pipe считает NLI-проход batch_size×{len(labels)} пар на каждый батч")
-    except Exception as e:
-        logging.error(f"[LAB INIT] Labels fetch failed: {e}")
-        # Пустой labeldict → classification_labels=[] в tag.py → zs_pipe падает →
-        # весь батч теряется. Фолбэк не даёт batch'у молча обнулиться при недоступности GitHub.
-        labels = {"other": "fallback label used when class_names.json is unreachable"}
+    labels = {name: "" for name in CLASSIFICATION_LABELS}
+    logging.info(f"[LAB INIT] Classification labels: {len(labels)}, backend={CLASSIFICATION_BACKEND}")
 
     lab_configuration = {
         "labeldict":           labels,
