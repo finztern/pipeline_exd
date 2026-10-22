@@ -19,6 +19,8 @@ logging.basicConfig(level=logging.INFO)
 
 _cpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tag_cpu")
 
+SKIP_DEPRECATED = os.getenv("TAG_SKIP_DEPRECATED", "true").lower() == "true"
+
 SENTIMENT_WEIGHTS = (
     (0.6, (0.30, 0.10, 0.60)),
     (0.4, (0.40, 0.20, 0.40)),
@@ -80,6 +82,14 @@ def classify_cosine(model, text_embeddings, labels):
     return [{"labels": [labels[int(b)]], "scores": [float(sc)]} for b, sc in zip(best, scores)]
 
 
+def _placeholder_text_type():
+    return TextType(assumption=0.0, anecdote=0.0, none=1.0, definition=0.0, testimony=0.0, other=0.0, study=0.0)
+
+
+def _placeholder_irony():
+    return Irony(irony=0.0, non_irony=1.0)
+
+
 def _pos_minus_neg(prediction):
     d = {str(e["label"]).lower(): float(e["score"]) for e in prediction}
     return round(d.get("positive", 0.0) - d.get("negative", 0.0), 3)
@@ -124,11 +134,10 @@ def tag(documents: list[str], lab_configuration):
     fdb_pipe = models['fdb_pipe']
     gdb_pipe = models['gdb_pipe']
 
-    text_classification_models = {
-        "Emotion": models['Emotion'],
-        "Irony": models['Irony'],
-        "TextType": models['TextType']
-    }
+    text_classification_models = {"Emotion": models['Emotion']}
+    if not SKIP_DEPRECATED:
+        text_classification_models["Irony"] = models['Irony']
+        text_classification_models["TextType"] = models['TextType']
 
     batch_size = min(len(documents), int(os.getenv("TAG_HF_BATCH_SIZE", "64")))
     logging.info(f"Using batch_size: {batch_size} for {len(documents)} documents, labels={len(classification_labels)}")
@@ -166,14 +175,17 @@ def tag(documents: list[str], lab_configuration):
         lap("cls")
         classification_ms = timings.pop("cls") * 1000
 
-        text_type_results = text_classification_models['TextType'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
-        lap("ttype")
+        text_type_results = irony_results = None
+        if not SKIP_DEPRECATED:
+            text_type_results = text_classification_models['TextType'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
+            lap("ttype")
 
         emotion_results = text_classification_models['Emotion'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
         lap("emo")
 
-        irony_results = text_classification_models['Irony'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
-        lap("irony")
+        if not SKIP_DEPRECATED:
+            irony_results = text_classification_models['Irony'](documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
+            lap("irony")
 
         fdb_predictions = fdb_pipe(documents, batch_size=batch_size, **HF_SAFETY_KWARGS)
         lap("fdb")
@@ -205,17 +217,20 @@ def tag(documents: list[str], lab_configuration):
             top_score = round(classification_result["scores"][0], 4)
             classification = Classification(label=top_label, score=top_score)
 
-            text_type_result = [(y["label"], float(y["score"])) for y in text_type_results[idx]]
-            types = {item[0]: item[1] for item in text_type_result}
-            text_type = TextType(
-                assumption=types.get("Assumption", 0.0),
-                anecdote=types.get("Anecdote", 0.0),
-                none=types.get("None", 0.0),
-                definition=types.get("Definition", 0.0),
-                testimony=types.get("Testimony", 0.0),
-                other=types.get("Other", 0.0),
-                study=types.get("Statistics/Study", 0.0),
-            )
+            if text_type_results is None:
+                text_type = _placeholder_text_type()
+            else:
+                text_type_result = [(y["label"], float(y["score"])) for y in text_type_results[idx]]
+                types = {item[0]: item[1] for item in text_type_result}
+                text_type = TextType(
+                    assumption=types.get("Assumption", 0.0),
+                    anecdote=types.get("Anecdote", 0.0),
+                    none=types.get("None", 0.0),
+                    definition=types.get("Definition", 0.0),
+                    testimony=types.get("Testimony", 0.0),
+                    other=types.get("Other", 0.0),
+                    study=types.get("Statistics/Study", 0.0),
+                )
 
             emotion_result = [(y["label"], float(y["score"])) for y in emotion_results[idx]]
             emotions = {item[0]: item[1] for item in emotion_result}
@@ -250,12 +265,15 @@ def tag(documents: list[str], lab_configuration):
                 nervousness=emotions.get("nervousness", 0.0),
             )
 
-            irony_result = [(y["label"], float(y["score"])) for y in irony_results[idx]]
-            ironies = {item[0]: item[1] for item in irony_result}
-            irony = Irony(
-                irony=ironies.get("irony", 0.0),
-                non_irony=ironies.get("non_irony", 0.0)
-            )
+            if irony_results is None:
+                irony = _placeholder_irony()
+            else:
+                irony_result = [(y["label"], float(y["score"])) for y in irony_results[idx]]
+                ironies = {item[0]: item[1] for item in irony_result}
+                irony = Irony(
+                    irony=ironies.get("irony", 0.0),
+                    non_irony=ironies.get("non_irony", 0.0)
+                )
 
             vader_sent_score = round(vader_scores[idx], 2)
             fin_vader_sent_score = round(finvader_scores[idx], 2)
@@ -275,10 +293,10 @@ def tag(documents: list[str], lab_configuration):
             gender = Gender(male=0.5, female=0.5)
 
             age = Age(
-                below_twenty=0.25,
-                twenty_thirty=0.25,
-                thirty_forty=0.25,
-                forty_more=0.25
+                below_twenty=0.0,
+                twenty_thirty=0.0,
+                thirty_forty=0.0,
+                forty_more=0.0
             )
 
             language_score = LanguageScore(1.0)
@@ -335,5 +353,5 @@ def create_fallback_analysis():
         text_type=TextType(assumption=0.0, anecdote=0.0, none=1.0, definition=0.0, testimony=0.0, other=0.0, study=0.0),
         emotion=Emotion(love=0.0, admiration=0.0, joy=0.0, approval=0.0, caring=0.0, excitement=0.0, gratitude=0.0, desire=0.0, anger=0.0, optimism=0.0, disapproval=0.0, grief=0.0, annoyance=0.0, pride=0.0, curiosity=0.0, neutral=1.0, disgust=0.0, disappointment=0.0, realization=0.0, fear=0.0, relief=0.0, confusion=0.0, remorse=0.0, embarrassment=0.0, surprise=0.0, sadness=0.0, nervousness=0.0),
         irony=Irony(irony=0.0, non_irony=1.0),
-        age=Age(below_twenty=0.25, twenty_thirty=0.25, thirty_forty=0.25, forty_more=0.25),
+        age=Age(below_twenty=0.0, twenty_thirty=0.0, thirty_forty=0.0, forty_more=0.0),
     )

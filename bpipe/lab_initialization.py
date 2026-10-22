@@ -29,6 +29,8 @@ CLASSIFICATION_BACKEND = os.getenv("CLASSIFICATION_BACKEND", "minilm_cosine").st
 if CLASSIFICATION_BACKEND not in ("zs", "minilm_cosine"):
     raise ValueError(f"CLASSIFICATION_BACKEND должен быть zs|minilm_cosine, получено: {CLASSIFICATION_BACKEND!r}")
 
+SKIP_DEPRECATED = os.getenv("TAG_SKIP_DEPRECATED", "true").lower() == "true"
+
 CLASSIFICATION_LABELS = [
     "Business", "People", "Investing", "Health", "Law", "Economy", "Technology", "Sports",
     "Cryptocurrency", "Environment", "Politics", "Finance", "Science", "Entertainment", "Social",
@@ -113,6 +115,10 @@ def initialize_models(device):
         ("Irony",    "cardiffnlp/twitter-roberta-base-irony"),
         ("TextType", "marieke93/MiniLM-evidence-types"),
     ]
+
+    if SKIP_DEPRECATED:
+        text_classification_models = [m for m in text_classification_models if m[0] == "Emotion"]
+        logging.info("[TAGGING] TAG_SKIP_DEPRECATED=true: Irony и TextType не грузятся")
 
     SNAPSHOT_REVISIONS = {
         "cardiffnlp/twitter-roberta-base-irony": "refs/pr/3",
