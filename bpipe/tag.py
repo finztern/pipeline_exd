@@ -135,7 +135,7 @@ def tag(documents: list[str], lab_configuration):
 
     zs_batch_size = int(os.getenv("TAG_ZS_BATCH_SIZE", "120"))
 
-    HF_SAFETY_KWARGS = {"truncation": True, "max_length": 512}
+    HF_SAFETY_KWARGS = {"truncation": True, "max_length": int(os.getenv("TAG_MAX_LENGTH", "512"))}
 
     def _cpu_sentiment():
         v = [sentiment_analyzer.polarity_scores(t)["compound"] for t in documents]
