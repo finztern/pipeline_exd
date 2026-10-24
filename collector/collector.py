@@ -211,14 +211,16 @@ def _parse_created_at(created_at_str: str) -> datetime | None:
     if not created_at_str:
         return None
     try:
-        s = created_at_str.rstrip("Z")
-        if "." in s:
-            dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f")
-        else:
-            dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
-        return dt.replace(tzinfo=timezone.utc)
-    except Exception:
+        dt = datetime.fromisoformat(str(created_at_str).strip().replace("Z", "+00:00"))
+    except (ValueError, TypeError):
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _fmt_created_at(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 def _detect_lang(content: str) -> tuple[str | None, float]:
@@ -538,6 +540,8 @@ async def _process_item(item) -> str:
         if age_seconds > MAX_OLDNESS_SECONDS:
             _stats["filtered_old"] += 1
             return "filtered_old"
+        # exorde_data принимает только ...SS(.fff)Z; threads.net шлёт +00:00
+        item["created_at"] = _fmt_created_at(tweet_dt)
     else:
         log.warning(f"⚠️ Не удалось распарсить created_at: {created_at_str!r}")
 
