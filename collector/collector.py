@@ -52,10 +52,15 @@ GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "30"))
 
 URL_DEDUP_MODE      = os.getenv("URL_DEDUP_MODE", "shadow").strip().lower()
 URL_DEDUP_API       = os.getenv("URL_DEDUP_API", "https://url-check.exorde.network").rstrip("/")
-URL_DEDUP_BATCH     = int(os.getenv("URL_DEDUP_BATCH", "100"))
-URL_DEDUP_FLUSH_SEC = float(os.getenv("URL_DEDUP_FLUSH_SECONDS", "2.0"))
-URL_DEDUP_TIMEOUT   = float(os.getenv("URL_DEDUP_TIMEOUT_SECONDS", "10"))
-URL_DEDUP_QUEUE_MAX = int(os.getenv("URL_DEDUP_QUEUE_MAX", "5000"))
+URL_DEDUP_BATCH     = max(1, int(os.getenv("URL_DEDUP_BATCH", "48")))
+URL_DEDUP_WORKERS   = max(1, int(os.getenv("URL_DEDUP_WORKERS", "4")))
+URL_DEDUP_FLUSH_SEC = float(os.getenv("URL_DEDUP_FLUSH_SECONDS", "0.1"))
+URL_DEDUP_TIMEOUT   = float(os.getenv("URL_DEDUP_TIMEOUT_SECONDS", "5"))
+URL_DEDUP_WAIT      = float(os.getenv("URL_DEDUP_WAIT_SECONDS", "3"))
+URL_DEDUP_QUEUE_MAX = int(os.getenv("URL_DEDUP_QUEUE_MAX", "20000"))
+URL_DEDUP_TTL       = float(os.getenv("URL_DEDUP_TTL_SECONDS", str(3 * 86400)))
+URL_DEDUP_CACHE_MAX = int(os.getenv("URL_DEDUP_CACHE_MAX", "200000"))
+URL_DEDUP_DOMAINS   = [d.strip().lower() for d in os.getenv("URL_DEDUP_DOMAINS", "").split(",") if d.strip()]
 
 LANG_ALIASES = {"zh-cn": "zh", "zh-tw": "zt", "no": "nb"}
 
@@ -75,7 +80,7 @@ _started = time.time()
 _stats = {
     "received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0,
     "foreign_sent": 0, "to_translate": 0, "truncated": 0, "errors": 0, "dropped": 0,
-    "to_gpu": 0, "gpu_failed": 0, "rescued_en": 0,
+    "to_gpu": 0, "gpu_failed": 0, "rescued_en": 0, "filtered_url_dup": 0,
 }
 _dom_buckets: deque = deque()
 _dom_totals = {"r": Counter(), "f": Counter()}
@@ -87,11 +92,15 @@ _session: aiohttp.ClientSession | None = None
 _bg_tasks: set = set()
 _gpu_down_until = 0.0
 
-_url_q: deque = deque()
+_url_pending: deque = deque()
+_url_evt: asyncio.Event | None = None
+_known_dups: OrderedDict = OrderedDict()
+_sent_urls: OrderedDict = OrderedDict()
+_url_dom: dict = {}
 _url_stats = {
-    "queued": 0, "checked": 0, "duplicates": 0, "invalid": 0,
-    "requests": 0, "errors": 0, "overflow": 0, "total_ms": 0.0, "last_ms": 0.0,
-    "sample": None, "last_error": None,
+    "queued": 0, "checked": 0, "duplicates": 0, "requests": 0, "errors": 0, "format_errors": 0,
+    "overflow": 0, "timeouts": 0, "cache_hits": 0, "self_dups": 0, "unmatched": 0,
+    "total_ms": 0.0, "last_ms": 0.0, "sample": None, "last_error": None,
 }
 
 
@@ -386,86 +395,164 @@ async def handle_stats(request: web.Request) -> web.Response:
     })
 
 
-def _cnt(v) -> int:
-    if isinstance(v, (list, tuple, set, dict)):
-        return len(v)
+def _url_domain(url: str) -> str:
     try:
-        return int(v)
-    except (TypeError, ValueError):
-        return 0
+        host = url.split("/", 3)[2].lower()
+    except IndexError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
 
 
-def _url_dedup_enqueue(url):
-    if URL_DEDUP_MODE != "shadow" or not isinstance(url, str) or not url:
-        return
-    if len(_url_q) >= URL_DEDUP_QUEUE_MAX:
+def _url_in_scope(domain: str) -> bool:
+    if not URL_DEDUP_DOMAINS:
+        return True
+    d = (domain or "").lower()
+    return any(d == x or d.endswith("." + x) for x in URL_DEDUP_DOMAINS)
+
+
+def _lru_add(od: OrderedDict, key, value, limit: int):
+    od[key] = value
+    od.move_to_end(key)
+    while len(od) > limit:
+        od.popitem(last=False)
+
+
+def _parse_dups(data):
+    if isinstance(data, dict):
+        for k in ("duplicates", "duplicate_urls", "duplicate", "urls", "data", "result"):
+            if isinstance(data.get(k), list):
+                data = data[k]
+                break
+        else:
+            return None
+    if not isinstance(data, list):
+        return None
+    return {u for u in data if isinstance(u, str)}
+
+
+def _url_submit(url: str, want_result: bool):
+    if len(_url_pending) >= URL_DEDUP_QUEUE_MAX:
         _url_stats["overflow"] += 1
-        return
-    _url_q.append(url)
+        return None
+    fut = asyncio.get_running_loop().create_future() if want_result else None
+    _url_pending.append((url, fut))
     _url_stats["queued"] += 1
+    _url_evt.set()
+    return fut
 
 
-async def _url_dedup_flush(urls: list):
+async def _url_is_duplicate(url: str) -> bool:
+    ts = _known_dups.get(url)
+    if ts is not None and time.time() - ts < URL_DEDUP_TTL:
+        _url_stats["cache_hits"] += 1
+        return True
+    fut = _url_submit(url, True)
+    if fut is None:
+        return False
+    try:
+        return await asyncio.wait_for(fut, URL_DEDUP_WAIT)
+    except asyncio.TimeoutError:
+        _url_stats["timeouts"] += 1
+        return False
+
+
+def _url_resolve(batch: list, dup_set: set):
+    for url, fut in batch:
+        if fut is not None and not fut.done():
+            fut.set_result(url in dup_set)
+
+
+async def _url_flush(batch: list):
+    urls = list(dict.fromkeys(u for u, _ in batch))
     t0 = time.monotonic()
+    dups = None
     try:
         async with _session.post(
-            f"{URL_DEDUP_API}/v1/detailed-check",
+            f"{URL_DEDUP_API}/v1/check",
             data=orjson.dumps({"urls": urls}),
             headers={"Content-Type": "application/json"},
             timeout=aiohttp.ClientTimeout(total=URL_DEDUP_TIMEOUT),
         ) as resp:
             body = await resp.read()
             if resp.status != 200:
-                raise RuntimeError(f"HTTP {resp.status}: {body[:200]!r}")
-            data = orjson.loads(body)
+                raise RuntimeError(f"HTTP {resp.status}: {body[:120]!r}")
+        if _url_stats["sample"] is None:
+            _url_stats["sample"] = body[:400].decode("utf-8", "replace")
+        dups = _parse_dups(orjson.loads(body))
+        if dups is None:
+            _url_stats["format_errors"] += 1
+            _url_stats["last_error"] = f"unexpected response: {body[:120]!r}"
     except Exception as e:
         _url_stats["errors"] += 1
-        _url_stats["last_error"] = str(e)[:200]
+        _url_stats["last_error"] = f"{type(e).__name__}: {e}"[:200]
+    if dups is None:
+        _url_resolve(batch, set())
         return
     ms = (time.monotonic() - t0) * 1000
+    norm = {d.rstrip("/") for d in dups}
+    dup_set = {u for u in urls if u in dups or u.rstrip("/") in norm}
+    _url_stats["unmatched"] += len(norm - {u.rstrip("/") for u in urls})
+    now = time.time()
+    for u in urls:
+        d = _url_domain(u)
+        if d not in _url_dom and len(_url_dom) >= 200:
+            d = "other"
+        rec = _url_dom.setdefault(d, [0, 0])
+        rec[0] += 1
+        if u in dup_set:
+            rec[1] += 1
+            if URL_DEDUP_MODE == "enforce":
+                _lru_add(_known_dups, u, now, URL_DEDUP_CACHE_MAX)
+            if u in _sent_urls:
+                _url_stats["self_dups"] += 1
     _url_stats["requests"] += 1
     _url_stats["total_ms"] += ms
     _url_stats["last_ms"] = round(ms, 1)
     _url_stats["checked"] += len(urls)
-    _url_stats["duplicates"] += _cnt(data.get("duplicates_found"))
-    _url_stats["invalid"] += _cnt(data.get("invalid_urls"))
-    if _url_stats["sample"] is None:
-        _url_stats["sample"] = body[:600].decode("utf-8", "replace")
-    if _url_stats["requests"] % 20 == 1:
+    _url_stats["duplicates"] += len(dup_set)
+    _url_resolve(batch, dup_set)
+    if _url_stats["requests"] % 50 == 1:
         log.info(
-            f"🔎 url-dedup shadow: checked={_url_stats['checked']} dup={_url_stats['duplicates']} "
-            f"invalid={_url_stats['invalid']} last={ms:.0f}ms"
+            f"🔎 url-dedup {URL_DEDUP_MODE}: checked={_url_stats['checked']} dup={_url_stats['duplicates']} "
+            f"pending={len(_url_pending)} last={ms:.0f}ms"
         )
 
 
-async def _url_dedup_loop():
-    last = time.monotonic()
+async def _url_worker():
     while True:
-        await asyncio.sleep(0.5)
-        if not _url_q:
-            last = time.monotonic()
-            continue
-        if len(_url_q) < URL_DEDUP_BATCH and time.monotonic() - last < URL_DEDUP_FLUSH_SEC:
-            continue
-        urls = [_url_q.popleft() for _ in range(min(URL_DEDUP_BATCH, len(_url_q)))]
-        last = time.monotonic()
-        await _url_dedup_flush(urls)
+        await _url_evt.wait()
+        if len(_url_pending) < URL_DEDUP_BATCH:
+            await asyncio.sleep(URL_DEDUP_FLUSH_SEC)
+        batch = [_url_pending.popleft() for _ in range(min(URL_DEDUP_BATCH, len(_url_pending)))]
+        if not _url_pending:
+            _url_evt.clear()
+        if batch:
+            await _url_flush(batch)
 
 
 def _url_dedup_snapshot() -> dict:
     st = _url_stats
     checked, reqs = st["checked"], st["requests"]
+    top = sorted(_url_dom.items(), key=lambda kv: kv[1][0], reverse=True)[:15]
     return {
         "mode": URL_DEDUP_MODE,
-        "queue": len(_url_q),
+        "workers": URL_DEDUP_WORKERS,
+        "batch": URL_DEDUP_BATCH,
+        "domains": URL_DEDUP_DOMAINS or "all",
+        "pending": len(_url_pending),
         "queued": st["queued"],
         "checked": checked,
         "duplicates": st["duplicates"],
-        "invalid": st["invalid"],
         "hit_rate": round(st["duplicates"] / checked, 4) if checked else None,
+        "by_domain": {d: {"checked": c, "dups": k, "rate": round(k / c, 3) if c else None} for d, (c, k) in top},
+        "self_dups": st["self_dups"],
+        "cache_hits": st["cache_hits"],
         "requests": reqs,
         "errors": st["errors"],
+        "format_errors": st["format_errors"],
+        "timeouts": st["timeouts"],
         "overflow": st["overflow"],
+        "unmatched": st["unmatched"],
         "avg_ms": round(st["total_ms"] / reqs, 1) if reqs else None,
         "last_ms": st["last_ms"],
         "last_error": st["last_error"],
@@ -545,7 +632,14 @@ async def _process_item(item) -> str:
     else:
         log.warning(f"⚠️ Не удалось распарсить created_at: {created_at_str!r}")
 
-    _url_dedup_enqueue(item.get("url"))
+    url = item.get("url")
+    if URL_DEDUP_MODE != "off" and isinstance(url, str) and url and _url_in_scope(domain):
+        if URL_DEDUP_MODE == "enforce":
+            if await _url_is_duplicate(url):
+                _stats["filtered_url_dup"] += 1
+                return "url_duplicate"
+        else:
+            _url_submit(url, False)
 
     if gpu_route:
         _forward_gpu(item, raw_item)
@@ -554,6 +648,8 @@ async def _process_item(item) -> str:
 
     if await forward_to_upipe(item):
         _stats["forwarded"] += 1
+        if URL_DEDUP_MODE != "off" and isinstance(url, str) and url:
+            _lru_add(_sent_urls, url, True, URL_DEDUP_CACHE_MAX)
         _dom_record(domain, "f")
         if _stats["forwarded"] % 50 == 0:
             log.info(
@@ -628,12 +724,17 @@ async def on_startup(app: web.Application):
     _session = aiohttp.ClientSession(connector=connector)
     if TRANSLATE:
         app["poller"] = asyncio.create_task(_poll_translator())
-    if URL_DEDUP_MODE == "shadow":
-        app["url_dedup"] = asyncio.create_task(_url_dedup_loop())
+    global _url_evt
+    _url_evt = asyncio.Event()
+    if URL_DEDUP_MODE in ("shadow", "enforce"):
+        app["url_workers"] = [asyncio.create_task(_url_worker()) for _ in range(URL_DEDUP_WORKERS)]
     log.info(f"🚀 Collector запущен на порту {COLLECTOR_PORT}")
     log.info(f"   Пересылает в upipe: {UPIPE_URL}")
     log.info(f"   Опрос очередей bpipe: {BPIPE_URLS}")
-    log.info(f"   URL dedup: {URL_DEDUP_MODE} api={URL_DEDUP_API} batch={URL_DEDUP_BATCH}")
+    log.info(
+        f"   URL dedup: {URL_DEDUP_MODE} api={URL_DEDUP_API} batch={URL_DEDUP_BATCH} "
+        f"workers={URL_DEDUP_WORKERS} domains={URL_DEDUP_DOMAINS or 'all'}"
+    )
     log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
     log.info(f"   TRANSLATE={TRANSLATE} translator={TRANSLATOR_URL if TRANSLATE else '-'}")
     log.info(f"   GPU translator: {GPU_TRANSLATOR_URL or 'выключен'} (причины: {sorted(GPU_ROUTE_REASONS)})")
@@ -645,8 +746,8 @@ async def on_shutdown(app: web.Application):
     global _session
     if "poller" in app:
         app["poller"].cancel()
-    if "url_dedup" in app:
-        app["url_dedup"].cancel()
+    for t in app.get("url_workers", []):
+        t.cancel()
     if _session:
         await _session.close()
     log.info(f"📊 Итог: {_stats}")
