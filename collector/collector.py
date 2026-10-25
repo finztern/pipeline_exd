@@ -60,6 +60,7 @@ URL_DEDUP_WAIT      = float(os.getenv("URL_DEDUP_WAIT_SECONDS", "3"))
 URL_DEDUP_QUEUE_MAX = int(os.getenv("URL_DEDUP_QUEUE_MAX", "20000"))
 URL_DEDUP_TTL       = float(os.getenv("URL_DEDUP_TTL_SECONDS", str(3 * 86400)))
 URL_DEDUP_CACHE_MAX = int(os.getenv("URL_DEDUP_CACHE_MAX", "200000"))
+URL_LOCAL_DEDUP     = os.getenv("URL_LOCAL_DEDUP", "true").lower() == "true"
 URL_DEDUP_DOMAINS   = [d.strip().lower() for d in os.getenv("URL_DEDUP_DOMAINS", "").split(",") if d.strip()]
 
 LANG_ALIASES = {"zh-cn": "zh", "zh-tw": "zt", "no": "nb"}
@@ -80,7 +81,7 @@ _started = time.time()
 _stats = {
     "received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0,
     "foreign_sent": 0, "to_translate": 0, "truncated": 0, "errors": 0, "dropped": 0,
-    "to_gpu": 0, "gpu_failed": 0, "rescued_en": 0, "filtered_url_dup": 0,
+    "to_gpu": 0, "gpu_failed": 0, "rescued_en": 0, "filtered_url_dup": 0, "filtered_url_local": 0,
 }
 _dom_buckets: deque = deque()
 _dom_totals = {"r": Counter(), "f": Counter()}
@@ -497,7 +498,7 @@ async def _url_flush(batch: list):
         d = _url_domain(u)
         if d not in _url_dom and len(_url_dom) >= 200:
             d = "other"
-        rec = _url_dom.setdefault(d, [0, 0])
+        rec = _url_dom.setdefault(d, [0, 0, 0])
         rec[0] += 1
         if u in dup_set:
             rec[1] += 1
@@ -505,6 +506,7 @@ async def _url_flush(batch: list):
                 _lru_add(_known_dups, u, now, URL_DEDUP_CACHE_MAX)
             if u in _sent_urls:
                 _url_stats["self_dups"] += 1
+                rec[2] += 1
     _url_stats["requests"] += 1
     _url_stats["total_ms"] += ms
     _url_stats["last_ms"] = round(ms, 1)
@@ -544,7 +546,7 @@ def _url_dedup_snapshot() -> dict:
         "checked": checked,
         "duplicates": st["duplicates"],
         "hit_rate": round(st["duplicates"] / checked, 4) if checked else None,
-        "by_domain": {d: {"checked": c, "dups": k, "rate": round(k / c, 3) if c else None} for d, (c, k) in top},
+        "by_domain": {d: {"checked": c, "dups": k, "self": sf, "net_rate": round((k - sf) / c, 3) if c else None} for d, (c, k, sf) in top},
         "self_dups": st["self_dups"],
         "cache_hits": st["cache_hits"],
         "requests": reqs,
@@ -582,6 +584,13 @@ async def _process_item(item) -> str:
         if len(_seen_ids) > _DEDUP_MAX_SIZE:
             for _ in range(_DEDUP_MAX_SIZE // 2):
                 _seen_ids.popitem(last=False)
+
+    url = item.get("url")
+    if URL_LOCAL_DEDUP and isinstance(url, str) and url:
+        ts = _sent_urls.get(url)
+        if ts is not None and time.time() - ts < URL_DEDUP_TTL:
+            _stats["filtered_url_local"] += 1
+            return "duplicate"
 
     if len(content) < MIN_TEXT_LEN:
         return "skipped_short"
@@ -632,7 +641,6 @@ async def _process_item(item) -> str:
     else:
         log.warning(f"⚠️ Не удалось распарсить created_at: {created_at_str!r}")
 
-    url = item.get("url")
     if URL_DEDUP_MODE != "off" and isinstance(url, str) and url and _url_in_scope(domain):
         if URL_DEDUP_MODE == "enforce":
             if await _url_is_duplicate(url):
@@ -648,8 +656,8 @@ async def _process_item(item) -> str:
 
     if await forward_to_upipe(item):
         _stats["forwarded"] += 1
-        if URL_DEDUP_MODE != "off" and isinstance(url, str) and url:
-            _lru_add(_sent_urls, url, True, URL_DEDUP_CACHE_MAX)
+        if isinstance(url, str) and url:
+            _lru_add(_sent_urls, url, time.time(), URL_DEDUP_CACHE_MAX)
         _dom_record(domain, "f")
         if _stats["forwarded"] % 50 == 0:
             log.info(
