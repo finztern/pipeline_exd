@@ -5,7 +5,9 @@ import statistics
 import time
 from urllib.parse import quote, unquote, urlsplit
 
-from aiohttp import BasicAuth, ClientSession, ClientTimeout, FormData, TCPConnector
+import uuid
+
+from aiohttp import BasicAuth, ClientSession, ClientTimeout, TCPConnector
 from aiohttp_socks import ProxyConnector
 
 log = logging.getLogger("routes")
@@ -63,6 +65,17 @@ def _parse_proxy(line: str) -> list:
         return []
     user, pwd = unquote(u.username or ""), unquote(u.password or "")
     return [(s, host, port, user, pwd) for s in schemes if s == "http" or s in SOCKS_SCHEMES]
+
+
+def multipart_file(filename: str, content: str) -> tuple:
+    b = uuid.uuid4().hex
+    head = (f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f'Content-Type: application/json\r\n\r\n').encode()
+    return head + content.encode("utf-8") + f"\r\n--{b}--\r\n".encode(), f"multipart/form-data; boundary={b}"
+
+
+def is_mangled(status: int, body: str) -> bool:
+    return status == 400 and "multipart" in body.lower()
 
 
 class Route:
@@ -139,22 +152,26 @@ class RouteManager:
                 t0 = time.perf_counter()
                 try:
                     if PROBE_POST_BYTES > 0:
-                        form = FormData()
-                        body = '{"items":[],"kind":"SPOTTING","pad":"' + "x" * PROBE_POST_BYTES + '"}'
-                        form.add_field("file", body, filename="probe.json", content_type="application/json")
-                        req = r.request("POST", self.upload_url, data=form, headers={"MAIN_ADDRESS": MAIN_ADDRESS},
+                        payload, ctype = multipart_file(
+                            "probe.json", '{"items":[],"kind":"SPOTTING","pad":"' + "x" * PROBE_POST_BYTES + '"}',
+                        )
+                        req = r.request("POST", self.upload_url, data=payload,
+                                        headers={"MAIN_ADDRESS": MAIN_ADDRESS, "Content-Type": ctype},
                                         timeout=ClientTimeout(total=PROBE_TIMEOUT))
                     else:
                         req = r.request("HEAD", self.probe_url, timeout=ClientTimeout(total=PROBE_TIMEOUT),
                                         allow_redirects=False)
                     async with req as resp:
-                        await resp.read()
+                        text = (await resp.read()).decode("utf-8", "replace")
                         status = resp.status
                 except Exception as e:
                     err = f"{type(e).__name__}: {e}"[:120]
                     break
                 if status in BAD_STATUS:
                     err = f"HTTP {status}"
+                    break
+                if PROBE_POST_BYTES > 0 and is_mangled(status, text):
+                    err = "прокси ломает multipart"
                     break
                 times.append((time.perf_counter() - t0) * 1000)
             r.ok = bool(times) and not err

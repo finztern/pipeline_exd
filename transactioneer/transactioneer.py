@@ -7,9 +7,9 @@ import time
 from collections import Counter, deque
 from typing import Optional
 
-from aiohttp import web, FormData, ClientTimeout
+from aiohttp import web, ClientTimeout
 
-from route_manager import RouteManager
+from route_manager import RouteManager, multipart_file, is_mangled
 
 logging.basicConfig(
     level=logging.INFO,
@@ -128,18 +128,12 @@ async def upload_to_api(items: list, main_address: str) -> Optional[dict]:
         await _upload_sem.acquire()
         t0 = time.monotonic()
         try:
-            form = FormData()
-            form.add_field(
-                "file",
-                batch_json,
-                filename=f"batch_{int(time.time())}.json",
-                content_type="application/json",
-            )
+            payload, ctype = multipart_file(f"batch_{int(time.time())}.json", batch_json)
             async with route.request(
                 "POST",
                 UPLOAD_API_URL,
-                data=form,
-                headers={"MAIN_ADDRESS": main_address},
+                data=payload,
+                headers={"MAIN_ADDRESS": main_address, "Content-Type": ctype},
                 timeout=ClientTimeout(total=UPLOAD_API_TIMEOUT),
             ) as resp:
                 if resp.status == 200:
@@ -169,7 +163,7 @@ async def upload_to_api(items: list, main_address: str) -> Optional[dict]:
                     return data
                 err = await resp.text()
                 log.error(f"❌ HTTP {resp.status} via {route.name}: {err[:300]}")
-                if resp.status in ROUTE_FAIL_STATUS:
+                if resp.status in ROUTE_FAIL_STATUS or is_mangled(resp.status, err):
                     routes.report_failure(route)
 
         except asyncio.TimeoutError:
