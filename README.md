@@ -254,3 +254,14 @@ docker compose up -d --build collector transactioneer   # один раз: до�
 ```
 
 Клавиши: `0` всё подряд · `1` обзор · `2` домены · `3` переводы и ошибки · `Tab` след. страница · `d` число строк доменов · `+/-` интервал опроса · `r` обновить. Разовый вывод: `./dashboard.sh --once`.
+
+## Маршруты выгрузки (direct / VPN / прокси)
+
+`vpn.txt` — vless:// по строке (tls/reality; tcp, ws, httpupgrade, grpc, xhttp); `proxy.txt` — `user:pass@host:port` (без схемы пробуются http и socks5). Файлы не коммитятся (`*.example` — шаблоны); перед запуском `touch vpn.txt proxy.txt` (или через `./run.sh`).
+
+transactioneer раз в `ROUTE_PROBE_INTERVAL` сек меряет задержку до Upload API по каждому маршруту (direct, каждый vless-узел, каждый прокси) и грузит через самый быстрый; при сбое маршрут уходит в паузу и берётся следующий. Прокси медленнее `ROUTE_PROXY_MAX_MS` не используются.
+
+```bash
+docker compose exec transactioneer curl -s localhost:8002/routes | python3 -m json.tool
+```
+`ROUTE_MODE=auto|direct|vpn|proxy` — принудительный режим; `ROUTE_ALLOW_DIRECT=false` — запретить прямой выход. Изменения vpn.txt/proxy.txt: `docker compose up -d --build vpn transactioneer`.

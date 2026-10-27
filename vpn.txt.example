@@ -1,0 +1,2 @@
+# по одной vless:// ссылке в строке (tls/reality; tcp, ws, httpupgrade, grpc, xhttp)
+vless://UUID@host:443?security=tls&type=httpupgrade&path=%2Fpath%2F&host=example.com&sni=example.com&fp=chrome#name

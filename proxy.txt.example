@@ -1,0 +1,3 @@
+# user:pass@host:port — без схемы проверяются оба варианта (http и socks5)
+# явная схема: http:// socks5:// socks4://
+user:pass@1.2.3.4:3129

@@ -13,11 +13,13 @@ services:
     restart: unless-stopped
     logging: *default-logging
     environment:
-      VLESS_URL:     "${VLESS_URL}"
+      VLESS_URL:     "${VLESS_URL:-}"
       SOCKS_PORT:    "1080"
       HTTP_PORT:     "1081"
       DISABLE_PQV:   "${VPN_DISABLE_PQV:-false}"
       XRAY_LOG_LEVEL: "${VPN_LOG_LEVEL:-warning}"
+    volumes:
+      - ./vpn.txt:/vpn/vpn.txt:ro
     ports:
       - "127.0.0.1:1080:1080"
       - "127.0.0.1:1081:1081"
@@ -37,7 +39,7 @@ services:
     cpus: "${TRANSLATOR_CPUS:-4}"
     depends_on:
       vpn:
-        condition: service_healthy
+        condition: service_started
     environment:
       TRANSLATOR_PORT:           "8003"
       TRANSLATE:                 "${TRANSLATE:-false}"
@@ -70,17 +72,29 @@ services:
     logging: *default-logging
     depends_on:
       vpn:
-        condition: service_healthy
+        condition: service_started
     environment:
       TRANSACTIONEER_PORT: "8002"
       UPLOAD_API_URL:      "http://upload.exorde.network/v1/upload"
       MAIN_ADDRESS:        "${MAIN_ADDRESS}"
       UPLOAD_API_TIMEOUT:  "120"
       UPLOAD_MAX_RETRIES:  "3"
-      USE_PROXY:           "${USE_PROXY_TRANSACTIONEER:-true}"
-      PROXY_URL:           "socks5://vpn:1080"
+      VLESS_URL:           "${VLESS_URL:-}"
+      ROUTE_MODE:          "${ROUTE_MODE:-auto}"
+      ROUTE_ALLOW_DIRECT:  "${ROUTE_ALLOW_DIRECT:-true}"
+      ROUTE_PROXY_MAX_MS:  "${ROUTE_PROXY_MAX_MS:-1500}"
+      ROUTE_PROBE_INTERVAL: "${ROUTE_PROBE_INTERVAL:-300}"
+      ROUTE_PROBE_SAMPLES: "${ROUTE_PROBE_SAMPLES:-3}"
+      ROUTE_PROBE_TIMEOUT: "${ROUTE_PROBE_TIMEOUT:-8}"
+      ROUTE_SWITCH_MARGIN: "${ROUTE_SWITCH_MARGIN:-0.85}"
+      ROUTE_FAIL_COOLDOWN: "${ROUTE_FAIL_COOLDOWN:-60}"
+      ROUTE_VPN_HOST:      "vpn"
+      ROUTE_VPN_BASE_PORT: "10800"
     expose:
       - "8002"
+    volumes:
+      - ./vpn.txt:/data/vpn.txt:ro
+      - ./proxy.txt:/data/proxy.txt:ro
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8002/health"]
       interval: 10s

@@ -2,6 +2,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+for f in vpn.txt proxy.txt; do
+  [ -d "$f" ] && { echo "$f — каталог (docker создал при отсутствии файла); удали: rm -r $f" >&2; exit 1; }
+  [ -e "$f" ] || : > "$f"
+done
+
 N=1
 if [ -f .env ]; then
   V=$(grep -E '^BPIPE_REPLICAS=' .env | tail -1 | cut -d= -f2- | tr -d '[:space:]')

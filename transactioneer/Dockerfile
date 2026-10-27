@@ -18,7 +18,7 @@ RUN git clone --branch full --single-branch --no-recurse-submodules --depth 1 \
     && pip install --no-cache-dir /tmp/exorde_data \
     && rm -rf /tmp/exorde_data
 
-COPY transactioneer.py .
+COPY transactioneer.py route_manager.py .
 
 HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:8002/health || exit 1

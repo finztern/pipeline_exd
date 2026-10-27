@@ -4,3 +4,5 @@ argos_data/
 ct2_models/
 __pycache__/
 *.pyc
+vpn.txt
+proxy.txt

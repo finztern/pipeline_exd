@@ -7,7 +7,9 @@ import time
 from collections import Counter, deque
 from typing import Optional
 
-from aiohttp import web, ClientSession, FormData, ClientTimeout
+from aiohttp import web, FormData, ClientTimeout
+
+from route_manager import RouteManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,9 +22,10 @@ TRANSACTIONEER_PORT = int(os.getenv("TRANSACTIONEER_PORT", "8002"))
 UPLOAD_API_URL      = os.getenv("UPLOAD_API_URL", "http://upload.exorde.network/v1/upload")
 MAIN_ADDRESS        = os.getenv("MAIN_ADDRESS", "")
 UPLOAD_API_TIMEOUT  = int(os.getenv("UPLOAD_API_TIMEOUT", "120"))
-USE_PROXY           = os.getenv("USE_PROXY", "false").lower() == "true"
-PROXY_URL           = os.getenv("PROXY_URL", "")
 MAX_RETRIES         = int(os.getenv("UPLOAD_MAX_RETRIES", "3"))
+
+ROUTE_FAIL_STATUS = {403, 407, 451, 500, 502, 503, 504}
+routes = RouteManager(UPLOAD_API_URL)
 
 _started = time.monotonic()
 _stats = {
@@ -110,12 +113,18 @@ async def upload_to_api(items: list, main_address: str) -> Optional[dict]:
     batch_json = json.dumps({"items": items, "kind": "SPOTTING"}, default=str, ensure_ascii=False)
 
     for attempt in range(MAX_RETRIES):
-        try:
-            if attempt > 0:
-                delay = 2 ** attempt
-                log.info(f"🔄 Повторная попытка {attempt+1}/{MAX_RETRIES} через {delay}с...")
-                await asyncio.sleep(delay)
+        if attempt > 0:
+            delay = 2 ** attempt
+            log.info(f"🔄 Повторная попытка {attempt+1}/{MAX_RETRIES} через {delay}с...")
+            await asyncio.sleep(delay)
 
+        route = routes.pick()
+        if route is None:
+            log.error("❌ нет доступных маршрутов выгрузки")
+            continue
+
+        t0 = time.monotonic()
+        try:
             form = FormData()
             form.add_field(
                 "file",
@@ -123,53 +132,49 @@ async def upload_to_api(items: list, main_address: str) -> Optional[dict]:
                 filename=f"batch_{int(time.time())}.json",
                 content_type="application/json",
             )
+            async with route.request(
+                "POST",
+                UPLOAD_API_URL,
+                data=form,
+                headers={"MAIN_ADDRESS": main_address},
+                timeout=ClientTimeout(total=UPLOAD_API_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    data       = await resp.json()
+                    file_id    = data.get("file_id", "?")
+                    filtered   = data.get("filtered_items", 0)
+                    rejected   = data.get("rejected_items", 0)
+                    duplicates = data.get("duplicate_items", 0)
+                    proc_ms    = data.get("processing_time_ms", 0)
+                    routes.report_success(route)
 
-            connector_kwargs = {}
-            if USE_PROXY and PROXY_URL:
-                try:
-                    from aiohttp_socks import ProxyConnector
-                    connector_kwargs["connector"] = ProxyConnector.from_url(PROXY_URL)
-                except ImportError:
-                    log.warning("aiohttp_socks не установлен, прокси игнорируется")
+                    log.info(
+                        f"✅ Загружено | file_id={file_id} | "
+                        f"отправлено={len(items)} принято={filtered} "
+                        f"отклонено={rejected} дубликаты={duplicates} | "
+                        f"API обработка={proc_ms}ms | {route.name} {(time.monotonic()-t0)*1000:.0f}ms"
+                    )
 
-            async with ClientSession(**connector_kwargs) as session:
-                async with session.post(
-                    UPLOAD_API_URL,
-                    data=form,
-                    headers={"MAIN_ADDRESS": main_address},
-                    timeout=ClientTimeout(total=UPLOAD_API_TIMEOUT),
-                ) as resp:
-                    if resp.status == 200:
-                        data       = await resp.json()
-                        file_id    = data.get("file_id", "?")
-                        filtered   = data.get("filtered_items", 0)
-                        rejected   = data.get("rejected_items", 0)
-                        duplicates = data.get("duplicate_items", 0)
-                        proc_ms    = data.get("processing_time_ms", 0)
+                    if rejected > 0:
+                        log.warning(f"⚠️ Полный ответ API: {json.dumps(data, ensure_ascii=False)[:2000]}")
+                        try:
+                            with open(f"/tmp/rejected_batch_{file_id}.json", "w") as dbf:
+                                json.dump({"items": items[:3], "kind": "SPOTTING"}, dbf, default=str, ensure_ascii=False, indent=2)
+                        except Exception as de:
+                            log.warning(f"Не удалось сохранить debug файл: {de}")
 
-                        log.info(
-                            f"✅ Загружено | file_id={file_id} | "
-                            f"отправлено={len(items)} принято={filtered} "
-                            f"отклонено={rejected} дубликаты={duplicates} | "
-                            f"API обработка={proc_ms}ms"
-                        )
-
-                        if rejected > 0:
-                            log.warning(f"⚠️ Полный ответ API: {json.dumps(data, ensure_ascii=False)[:2000]}")
-                            try:
-                                with open(f"/tmp/rejected_batch_{file_id}.json", "w") as dbf:
-                                    json.dump({"items": items[:3], "kind": "SPOTTING"}, dbf, default=str, ensure_ascii=False, indent=2)
-                            except Exception as de:
-                                log.warning(f"Не удалось сохранить debug файл: {de}")
-
-                        return data
-                    err = await resp.text()
-                    log.error(f"❌ HTTP {resp.status}: {err[:300]}")
+                    return data
+                err = await resp.text()
+                log.error(f"❌ HTTP {resp.status} via {route.name}: {err[:300]}")
+                if resp.status in ROUTE_FAIL_STATUS:
+                    routes.report_failure(route)
 
         except asyncio.TimeoutError:
-            log.error(f"⏱️ Таймаут (попытка {attempt+1}/{MAX_RETRIES})")
+            log.error(f"⏱️ Таймаут via {route.name} (попытка {attempt+1}/{MAX_RETRIES})")
+            routes.report_failure(route)
         except Exception as e:
-            log.exception(f"❌ Ошибка при загрузке (попытка {attempt+1}/{MAX_RETRIES}): {e}")
+            log.error(f"❌ Ошибка загрузки via {route.name} (попытка {attempt+1}/{MAX_RETRIES}): {type(e).__name__}: {e}")
+            routes.report_failure(route)
 
     log.error(f"❌ Все {MAX_RETRIES} попытки загрузки исчерпаны")
     return None
@@ -212,6 +217,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "status": "ok",
         "main_address": MAIN_ADDRESS or "NOT SET",
         "upload_api": UPLOAD_API_URL,
+        "route": routes.active_name(),
         "stats": _stats,
         "active_tasks": len(_active_tasks),
     })
@@ -224,12 +230,22 @@ async def handle_stats(request: web.Request) -> web.Response:
         "totals": _totals,
         "rate": _rates(),
         "domains": _dom_snapshot(),
+        "route": routes.active_name(),
         "stats": _stats,
         "active_tasks": len(_active_tasks),
     })
 
 
+async def handle_routes(request: web.Request) -> web.Response:
+    return web.json_response(routes.snapshot())
+
+
 async def on_startup(app: web.Application):
+    try:
+        await asyncio.wait_for(routes.probe_all(), 60)
+    except Exception as e:
+        log.error(f"❌ первичная проверка маршрутов не завершена: {e}")
+    app["route_task"] = asyncio.create_task(routes.run())
     if not MAIN_ADDRESS:
         log.error("❌ MAIN_ADDRESS не задан! Установи его в .env файле")
     else:
@@ -238,12 +254,21 @@ async def on_startup(app: web.Application):
     log.info(f"   Порт: {TRANSACTIONEER_PORT}")
 
 
+async def on_cleanup(app: web.Application):
+    task = app.get("route_task")
+    if task:
+        task.cancel()
+    await routes.close()
+
+
 app = web.Application(client_max_size=500 * 1024 * 1024)
 app.router.add_post("/commit", handle_commit)
 app.router.add_get("/", handle_health)
 app.router.add_get("/health", handle_health)
 app.router.add_get("/stats", handle_stats)
+app.router.add_get("/routes", handle_routes)
 app.on_startup.append(on_startup)
+app.on_cleanup.append(on_cleanup)
 
 if __name__ == "__main__":
     web.run_app(app, host="0.0.0.0", port=TRANSACTIONEER_PORT, print=None)
