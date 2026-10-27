@@ -5,7 +5,7 @@ import statistics
 import time
 from urllib.parse import quote, unquote, urlsplit
 
-from aiohttp import BasicAuth, ClientSession, ClientTimeout, TCPConnector
+from aiohttp import BasicAuth, ClientSession, ClientTimeout, FormData, TCPConnector
 from aiohttp_socks import ProxyConnector
 
 log = logging.getLogger("routes")
@@ -19,8 +19,10 @@ VPN_HOST        = os.getenv("ROUTE_VPN_HOST", "vpn")
 VPN_BASE_PORT   = int(os.getenv("ROUTE_VPN_BASE_PORT", "10800"))
 PROBE_INTERVAL  = float(os.getenv("ROUTE_PROBE_INTERVAL", "300"))
 PROBE_SAMPLES   = max(1, int(os.getenv("ROUTE_PROBE_SAMPLES", "3")))
-PROBE_TIMEOUT   = float(os.getenv("ROUTE_PROBE_TIMEOUT", "8"))
-PROXY_MAX_MS    = float(os.getenv("ROUTE_PROXY_MAX_MS", "1500"))
+PROBE_TIMEOUT   = float(os.getenv("ROUTE_PROBE_TIMEOUT", "15"))
+PROXY_MAX_MS    = float(os.getenv("ROUTE_PROXY_MAX_MS", "3000"))
+PROBE_POST_BYTES = int(os.getenv("ROUTE_PROBE_POST_BYTES", "262144"))
+MAIN_ADDRESS    = os.getenv("MAIN_ADDRESS", "")
 SWITCH_MARGIN   = float(os.getenv("ROUTE_SWITCH_MARGIN", "0.85"))
 FAIL_COOLDOWN   = float(os.getenv("ROUTE_FAIL_COOLDOWN", "60"))
 FAIL_COOLDOWN_MAX = 1800.0
@@ -103,6 +105,7 @@ class Route:
 class RouteManager:
     def __init__(self, upload_url: str):
         u = urlsplit(upload_url)
+        self.upload_url = upload_url
         self.probe_url = os.getenv("ROUTE_PROBE_URL", "").strip() or f"{u.scheme}://{u.netloc}/"
         self.routes = self._build()
         self.current = None
@@ -135,9 +138,17 @@ class RouteManager:
             for _ in range(PROBE_SAMPLES):
                 t0 = time.perf_counter()
                 try:
-                    async with r.request(
-                        "HEAD", self.probe_url, timeout=ClientTimeout(total=PROBE_TIMEOUT), allow_redirects=False,
-                    ) as resp:
+                    if PROBE_POST_BYTES > 0:
+                        form = FormData()
+                        body = '{"items":[],"kind":"SPOTTING","pad":"' + "x" * PROBE_POST_BYTES + '"}'
+                        form.add_field("file", body, filename="probe.json", content_type="application/json")
+                        req = r.request("POST", self.upload_url, data=form, headers={"MAIN_ADDRESS": MAIN_ADDRESS},
+                                        timeout=ClientTimeout(total=PROBE_TIMEOUT))
+                    else:
+                        req = r.request("HEAD", self.probe_url, timeout=ClientTimeout(total=PROBE_TIMEOUT),
+                                        allow_redirects=False)
+                    async with req as resp:
+                        await resp.read()
                         status = resp.status
                 except Exception as e:
                     err = f"{type(e).__name__}: {e}"[:120]
@@ -220,7 +231,8 @@ class RouteManager:
         return {
             "mode": MODE,
             "active": self.active_name(),
-            "probe_url": self.probe_url,
+            "probe_url": self.upload_url if PROBE_POST_BYTES > 0 else self.probe_url,
+            "probe_post_bytes": PROBE_POST_BYTES,
             "probed_at": int(self.probed_at),
             "proxy_max_ms": PROXY_MAX_MS,
             "routes": [

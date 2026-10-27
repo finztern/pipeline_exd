@@ -23,9 +23,11 @@ UPLOAD_API_URL      = os.getenv("UPLOAD_API_URL", "http://upload.exorde.network/
 MAIN_ADDRESS        = os.getenv("MAIN_ADDRESS", "")
 UPLOAD_API_TIMEOUT  = int(os.getenv("UPLOAD_API_TIMEOUT", "120"))
 MAX_RETRIES         = int(os.getenv("UPLOAD_MAX_RETRIES", "3"))
+UPLOAD_CONCURRENCY  = max(1, int(os.getenv("UPLOAD_CONCURRENCY", "6")))
 
 ROUTE_FAIL_STATUS = {403, 407, 451, 500, 502, 503, 504}
 routes = RouteManager(UPLOAD_API_URL)
+_upload_sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
 
 _started = time.monotonic()
 _stats = {
@@ -123,6 +125,7 @@ async def upload_to_api(items: list, main_address: str) -> Optional[dict]:
             log.error("❌ нет доступных маршрутов выгрузки")
             continue
 
+        await _upload_sem.acquire()
         t0 = time.monotonic()
         try:
             form = FormData()
@@ -175,6 +178,8 @@ async def upload_to_api(items: list, main_address: str) -> Optional[dict]:
         except Exception as e:
             log.error(f"❌ Ошибка загрузки via {route.name} (попытка {attempt+1}/{MAX_RETRIES}): {type(e).__name__}: {e}")
             routes.report_failure(route)
+        finally:
+            _upload_sem.release()
 
     log.error(f"❌ Все {MAX_RETRIES} попытки загрузки исчерпаны")
     return None
