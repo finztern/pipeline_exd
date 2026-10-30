@@ -28,6 +28,7 @@ COLLECTOR_PORT      = int(os.getenv("COLLECTOR_PORT", "9000"))
 MIN_TEXT_LEN        = int(os.getenv("MIN_TEXT_LEN", "20"))
 MAX_TEXT_LEN        = int(os.getenv("MAX_TEXT_LEN", "20000"))
 MAX_OLDNESS_SECONDS = int(os.getenv("MAX_OLDNESS_SECONDS", "86400"))
+MAX_FUTURE_SECONDS  = int(os.getenv("MAX_FUTURE_SECONDS", "300"))
 LANG_FILTER         = os.getenv("LANG_FILTER", "en").strip().lower()
 BPIPE_URLS          = [u.strip() for u in os.getenv("BPIPE_URLS", "http://bpipe:7995/").split(",") if u.strip()]
 UPIPE_QUEUE_LIMIT   = int(os.getenv("UPIPE_QUEUE_LIMIT", "200"))
@@ -82,7 +83,7 @@ _started = time.time()
 _stats = {
     "received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0,
     "foreign_sent": 0, "to_translate": 0, "truncated": 0, "errors": 0, "dropped": 0,
-    "to_gpu": 0, "gpu_failed": 0, "rescued_en": 0, "filtered_url_dup": 0, "filtered_url_local": 0,
+    "to_gpu": 0, "gpu_failed": 0, "filtered_time": 0, "rescued_en": 0, "filtered_url_dup": 0, "filtered_url_local": 0,
 }
 _dom_buckets: deque = deque()
 _dom_totals = {"r": Counter(), "f": Counter()}
@@ -587,6 +588,25 @@ async def _process_item(item) -> str:
     if links_suffix:
         item["links_suffix"] = links_suffix
 
+    created_at_str = item.get("created_at", "")
+    tweet_dt = _parse_created_at(created_at_str)
+    if tweet_dt is None:
+        _stats["filtered_time"] += 1
+        if _stats["filtered_time"] % 20 == 1:
+            log.warning(f"⚠️ created_at не распарсен, item отброшен: {created_at_str!r} (domain={domain})")
+        return "invalid_created_at"
+    age_seconds = (datetime.now(timezone.utc) - tweet_dt).total_seconds()
+    if age_seconds > MAX_OLDNESS_SECONDS:
+        _stats["filtered_old"] += 1
+        return "filtered_old"
+    if age_seconds < -MAX_FUTURE_SECONDS:
+        _stats["filtered_time"] += 1
+        if _stats["filtered_time"] % 20 == 1:
+            log.warning(f"⚠️ created_at в будущем на {-age_seconds:.0f}с, item отброшен: {created_at_str!r} (domain={domain})")
+        return "filtered_future"
+    # exorde_data принимает только ...SS(.fff)Z; threads.net шлёт +00:00
+    item["created_at"] = _fmt_created_at(tweet_dt)
+
     ext_id = item.get("external_id", "")
     if ext_id:
         if ext_id in _seen_ids:
@@ -641,18 +661,6 @@ async def _process_item(item) -> str:
         content = content[:MAX_TEXT_LEN]
         item["content"] = content
         _stats["truncated"] += 1
-
-    created_at_str = item.get("created_at", "")
-    tweet_dt = _parse_created_at(created_at_str)
-    if tweet_dt is not None:
-        age_seconds = (datetime.now(timezone.utc) - tweet_dt).total_seconds()
-        if age_seconds > MAX_OLDNESS_SECONDS:
-            _stats["filtered_old"] += 1
-            return "filtered_old"
-        # exorde_data принимает только ...SS(.fff)Z; threads.net шлёт +00:00
-        item["created_at"] = _fmt_created_at(tweet_dt)
-    else:
-        log.warning(f"⚠️ Не удалось распарсить created_at: {created_at_str!r}")
 
     if URL_DEDUP_MODE != "off" and isinstance(url, str) and url and _url_in_scope(domain):
         if URL_DEDUP_MODE == "enforce":
