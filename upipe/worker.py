@@ -53,7 +53,7 @@ def run(raw: dict, tr) -> dict:
         "item": {
             "created_at":         str(processed.item.get("created_at", "")),
             "title":              str(processed.item.get("title", "")),
-            "content":            str(processed.item.get("content", "")),
+            "content":            str(processed.item.get("content", "")) + str(raw.get("links_suffix") or ""),
             "domain":             str(processed.item.get("domain", "")),
             "url":                str(processed.item.get("url", "")),
             "external_id":        str(processed.item.get("external_id", "")),

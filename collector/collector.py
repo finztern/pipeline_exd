@@ -73,6 +73,7 @@ _EN_WORDS = frozenset(
 )
 _WORD_RE = re.compile(r"[a-z']+")
 _STRIP_RE = re.compile(r"https?://\S+|@\w+|#\w+")
+_LINKS_TAIL_RE = re.compile(r"(?:\s+--https?://\S+)+\s*$")
 
 _seen_ids: OrderedDict = OrderedDict()
 _DEDUP_MAX_SIZE = 100_000
@@ -134,6 +135,13 @@ def _dom_snapshot() -> dict:
 
 def _norm_lang(lang: str) -> str:
     return LANG_ALIASES.get(lang, lang.split("-")[0])
+
+
+def _split_links(content: str) -> tuple[str, str]:
+    m = _LINKS_TAIL_RE.search(content)
+    if not m:
+        return content, ""
+    return content[:m.start()], m.group().rstrip()
 
 
 def _hash_author(author: str) -> str:
@@ -573,6 +581,11 @@ async def _process_item(item) -> str:
 
     raw_item = dict(item)
     item["author"] = _hash_author(item.get("author", ""))
+
+    content, links_suffix = _split_links(content)
+    item["content"] = content
+    if links_suffix:
+        item["links_suffix"] = links_suffix
 
     ext_id = item.get("external_id", "")
     if ext_id:

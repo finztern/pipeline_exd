@@ -137,7 +137,8 @@ async def _send_foreign(payload: dict):
 def _forward_foreign(raw_item: dict):
     if not FOREIGN_FORWARD_URL or _session is None:
         return
-    payload = {k: v for k, v in raw_item.items() if k not in ("detected_lang", "foreign_author", "lang_ok")}
+    payload = {k: v for k, v in raw_item.items() if k not in ("detected_lang", "foreign_author", "lang_ok", "links_suffix")}
+    payload["content"] = str(raw_item.get("content", "")) + str(raw_item.get("links_suffix") or "")
     payload["author"] = raw_item.get("foreign_author", raw_item.get("author", ""))
     _stats["foreign_sent"] += 1
     task = asyncio.create_task(_send_foreign(payload))
