@@ -41,6 +41,7 @@ STAGE_HINTS = {
     "token_count": "tiktoken: считать один раз, не дублировать; проверять длину по символам до encode",
     "build_item": "pydantic-подобная валидация Item: собирать один раз (сейчас строится и в main, и в воркере)",
     "preprocess": "почти no-op, можно убрать",
+    "langdetect": "langdetect в воркере (при пустом LANG_FILTER): заменить быстрым детектором или включить LANG_FILTER в collector",
     "zero_shot": "стаб, не влияет",
 }
 
@@ -72,6 +73,27 @@ def load_texts(path, n):
     return [lines[i % len(lines)] for i in range(n)]
 
 
+LANG_OK = False
+
+
+def tr_of(raw):
+    return ("en", raw["content"]) if raw.get("lang_ok") else None
+
+
+def filter_english(texts):
+    from translate import translate, NonEnglishError
+    from exorde_data import Item, CreatedAt, Content, Domain, Url
+    keep = []
+    for t in texts:
+        it = Item(created_at=CreatedAt("2026-01-01T00:00:00.000Z"), content=Content(t), domain=Domain("x"), url=Url("x"))
+        try:
+            translate(it, [])
+        except NonEnglishError:
+            continue
+        keep.append(t)
+    return keep
+
+
 def make_raws(n, texts):
     tag = uuid.uuid4().hex[:8]
     now = fmt_iso(datetime.now(timezone.utc))
@@ -85,7 +107,7 @@ def make_raws(n, texts):
             "external_id": f"{tag}_{i}",
             "author": f"a{i % 50}",
             "title": "",
-            "lang_ok": True,
+            "lang_ok": LANG_OK,
         }
         if i % 3 == 0:
             raw["links_suffix"] = f"\n--https://example.com/x{i}"
@@ -97,7 +119,7 @@ def run_chunk(chunk):
     import worker
     n = 0
     for raw in chunk:
-        worker.run(raw, ("en", raw["content"]))
+        worker.run(raw, tr_of(raw))
         n += 1
     return n
 
@@ -113,15 +135,23 @@ def profile(raws, warm):
     worker.init()
     lab = worker._lab
     for raw in raws[:warm]:
-        worker.run(raw, ("en", raw["content"]))
+        worker.run(raw, tr_of(raw))
 
     st = {k: [] for k in (
-        "build_item", "preprocess", "token_count", "keywords_yake_n1",
+        "langdetect", "build_item", "preprocess", "token_count", "keywords_yake_n1",
         "keywords_yake_n2", "keywords_postfilter", "zero_shot",
     )}
     pc = time.perf_counter_ns
     for raw in raws:
         t = pc(); item = worker.build_item(raw); st["build_item"].append(pc() - t)
+        if not raw.get("lang_ok"):
+            from translate import translate
+            t = pc()
+            try:
+                translate(item, [])
+            except Exception:
+                pass
+            st["langdetect"].append(pc() - t)
         t = pc(); item = preprocess(item, False); st["preprocess"].append(pc() - t)
         text = str(item.content)
         t = pc(); evaluate_token_count(text); st["token_count"].append(pc() - t)
@@ -139,7 +169,7 @@ def profile(raws, warm):
     for raw in raws:
         t = pc()
         try:
-            res = worker.run(raw, ("en", raw["content"]))
+            res = worker.run(raw, tr_of(raw))
             sample = sample or res
         except Exception:
             errors += 1
@@ -168,6 +198,8 @@ def print_profile(st, total, errors, parse_ns, dump_ns, pickled, build_mean_ns):
     mean_total = statistics.mean(total)
     rows = []
     for name, v in st.items():
+        if not v:
+            continue
         rows.append((name, statistics.mean(v), pct(v, 50), pct(v, 95)))
     rows.sort(key=lambda r: -r[1])
     ssum = sum(r[1] for r in rows)
@@ -189,11 +221,11 @@ def ipc_overhead(raws, inproc_mean_ns, n=200):
     ex = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"), initializer=worker.init)
     ex.submit(worker.ping).result()
     for raw in raws[:20]:
-        ex.submit(worker.run, raw, ("en", raw["content"])).result()
+        ex.submit(worker.run, raw, tr_of(raw)).result()
     lat = []
     for raw in raws[:n]:
         t = time.perf_counter_ns()
-        ex.submit(worker.run, raw, ("en", raw["content"])).result()
+        ex.submit(worker.run, raw, tr_of(raw)).result()
         lat.append(time.perf_counter_ns() - t)
     ex.shutdown()
     m = statistics.mean(lat)
@@ -244,9 +276,9 @@ def pool_run(raws, w, chunk):
     ex = ProcessPoolExecutor(max_workers=w, mp_context=mp.get_context("spawn"), initializer=worker.init)
     wait([ex.submit(worker.ping) for _ in range(w)])
     for raw in raws[:w * 5]:
-        ex.submit(worker.run, raw, ("en", raw["content"])).result()
+        ex.submit(worker.run, raw, tr_of(raw)).result()
     if chunk == 1:
-        tasks = [(worker.run, (r, ("en", r["content"]))) for r in raws]
+        tasks = [(worker.run, (r, tr_of(r))) for r in raws]
     else:
         tasks = [(run_chunk, (raws[i:i + chunk],)) for i in range(0, len(raws), chunk)]
     pending, started, lat, errors = {}, {}, [], 0
@@ -268,7 +300,8 @@ def pool_run(raws, w, chunk):
         now = time.perf_counter()
         for f in done:
             lat.append((now - pending.pop(f)) * 1e3)
-            if f.exception():
+            ex_ = f.exception()
+            if ex_ is not None and type(ex_).__name__ != "NonEnglishError":
                 errors += 1
     elapsed = time.perf_counter() - t0
     ex.shutdown()
@@ -530,6 +563,7 @@ def main():
     ap.add_argument("--bpipe-delay-ms", type=float, default=0.0)
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--no-e2e", action="store_true")
+    ap.add_argument("--lang-ok", action="store_true", help="как при LANG_FILTER=en: язык уже проверил collector (по умолчанию langdetect делает воркер)")
     ap.add_argument("--no-yake-variants", action="store_true")
     ap.add_argument("--out", default="bench_upipe_result.json")
     args = ap.parse_args()
@@ -541,7 +575,17 @@ def main():
     else:
         workers_list = sorted({1, 2, max(1, cpu // 2), cpu, cpu * 2})
 
+    global LANG_OK
+    LANG_OK = args.lang_ok
     pool_texts = load_texts(args.texts, 2000) if args.texts else make_texts(2000)
+    if not LANG_OK:
+        before = len(pool_texts)
+        pool_texts = filter_english(pool_texts)
+        print(f"режим: langdetect в воркере (LANG_FILTER пуст); не-английских отброшено: {before - len(pool_texts)} из {before}")
+        if not pool_texts:
+            raise SystemExit("нет английских текстов")
+    else:
+        print("режим: --lang-ok (collector уже проверил язык)")
     raws = make_raws(args.n, pool_texts)
     avg_len = statistics.mean(len(r["content"]) for r in raws)
     print(f"CPU: {cpu}; items: {args.n}; средняя длина текста: {avg_len:.0f} симв.; workers: {workers_list}")

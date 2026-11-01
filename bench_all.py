@@ -125,6 +125,18 @@ class Sampler(threading.Thread):
             self.stop_flag.wait(1.0)
 
 
+def sampler_summary(sampler, label):
+    parts = []
+    if sampler.gpu:
+        g = list(zip(*sampler.gpu))
+        parts.append(f"GPU util avg {statistics.mean(g[0]):.0f}% p95 {pct(g[0],95):.0f}%, VRAM max {max(g[1]):.0f}/{g[2][0]:.0f} МБ, "
+                     f"power avg {statistics.mean(g[3]):.0f} Вт, SM clock avg {statistics.mean(g[4]):.0f} МГц, temp max {max(g[5]):.0f}°C")
+    if sampler.cpu:
+        parts.append(f"CPU хоста avg {statistics.mean(sampler.cpu):.0f}% p95 {pct(sampler.cpu,95):.0f}%")
+    if parts:
+        out(f"[{label}] " + "; ".join(parts))
+
+
 def docker_stats():
     rc, o = sh(["docker", "stats", "--no-stream", "--format", "{{json .}}"], timeout=30)
     res = {}
@@ -203,7 +215,8 @@ def live_phase(seconds, outdir):
     out(f"\n=== 1. ЖИВАЯ СИСТЕМА ({seconds} с, боевой трафик, ничего не останавливаем) ===")
     cont = running_containers()
     if "collector" not in cont and "upipe" not in cont:
-        out("collector/upipe не запущены, фаза пропущена")
+        out("collector/upipe не запущены, фаза пропущена. Запусти систему (./run.sh up -d), дай поработать 3-5 минут и запусти бенч снова: "
+            "это самая важная часть для поиска узкого места")
         return {}
     sampler = Sampler()
     sampler.start()
@@ -265,9 +278,26 @@ def live_phase(seconds, outdir):
 
 def step(title, cmd, logpath, timeout):
     out(f"\n=== {title} ===")
+    sampler = Sampler()
+    sampler.start()
     rc, dt = run_logged(cmd, logpath, timeout)
+    sampler.stop_flag.set()
+    sampler.join(3)
     out(f"[{title}] rc={rc}, {dt:.0f} с")
+    sampler_summary(sampler, title)
     return rc
+
+
+def read_env():
+    res = {}
+    try:
+        for l in open(os.path.join(ROOT, ".env"), encoding="utf-8", errors="replace"):
+            if "=" in l and not l.lstrip().startswith("#"):
+                k, v = l.split("=", 1)
+                res[k.strip()] = v.strip().strip('"')
+    except Exception:
+        pass
+    return res
 
 
 def compose_run(outdir, service, mounts, py_args):
@@ -295,6 +325,7 @@ def main():
     ap.add_argument("--skip-collector", action="store_true")
     ap.add_argument("--skip-bpipe", action="store_true")
     ap.add_argument("--skip-concurrent", action="store_true")
+    ap.add_argument("--replicas", default="1,2,3,4,6", help="сколько реплик bpipe гонять одновременно на GPU")
     ap.add_argument("--texts", help="файл с реальными текстами (по одному на строку), положи в bench_out/")
     args = ap.parse_args()
 
@@ -329,7 +360,9 @@ def main():
                      "--workers", "1,6,12" if q else "1,2,4,6,8,12", "--queues", "200,2000", "--e2e-n", "600" if q else "1200"] + texts_arg
                 step("2. upipe: стадии, пул, e2e", compose_run(outdir, "upipe", [("upipe/bench_upipe.py", "/app/bench_upipe.py")], a),
                      os.path.join(outdir, "upipe.log"), 1800)
-            if not args.skip_collector:
+            if not args.skip_collector and not read_env().get("LANG_FILTER", "en"):
+                out("\n=== 3. collector langdetect пропущен: LANG_FILTER пуст, collector язык не определяет ===")
+            elif not args.skip_collector:
                 a = ["bench_lang.py", "--out", "/out/collector_lang.json"] + texts_arg
                 step("3. collector: скорость langdetect", compose_run(outdir, "collector", [("collector/bench_lang.py", "/app/bench_lang.py")], a),
                      os.path.join(outdir, "collector_lang.log"), 900)
@@ -344,20 +377,43 @@ def main():
                     best = max(rows, key=lambda r: r["docs_per_s"])
                 except Exception:
                     pass
-                if best and not args.skip_concurrent:
-                    for k in (1, 2):
-                        a = ["bench_tag.py", "--concurrent", str(k), "--n", str(best["n"]), "--hf", str(best["hf"]),
-                             "--maxlen", str(best["maxlen"]), "--duration", "20" if q else "30", "--warmup", "2"] + texts_arg
-                        step(f"5. bpipe: {k} реплик(и) одновременно на одной GPU (n={best['n']})",
-                             compose_run(outdir, "bpipe", mounts, a), os.path.join(outdir, f"bpipe_conc{k}.log"), 1800)
+                if not args.skip_concurrent:
+                    envs = read_env()
+                    n_ = int(envs.get("FIXED_BATCH_SIZE") or (best["n"] if best else 32))
+                    hf_ = int(envs.get("TAG_HF_BATCH_SIZE") or (best["hf"] if best else 16))
+                    ml_ = int(envs.get("TAG_MAX_LENGTH") or 512)
+                    out(f"\nРеплики на одной GPU с боевыми параметрами: n={n_} hf={hf_} maxlen={ml_}")
+                    prev_total = 0.0
+                    totals = {}
+                    for k in [int(x) for x in args.replicas.split(",")]:
+                        a = ["bench_tag.py", "--concurrent", str(k), "--n", str(n_), "--hf", str(hf_),
+                             "--maxlen", str(ml_), "--duration", "20" if q else "30", "--warmup", "2"] + texts_arg
+                        lp = os.path.join(outdir, f"bpipe_conc{k}.log")
+                        rc = step(f"5. bpipe: {k} реплик(и) одновременно на одной GPU", compose_run(outdir, "bpipe", mounts, a), lp, 1800)
+                        m = re.search(r"суммарно: ([\d.]+) docs/s", read_text(lp))
+                        if rc != 0 or not m:
+                            out(f"   {k} реплик(и): не удалось (OOM или падение), дальше не идём")
+                            break
+                        total = float(m.group(1))
+                        totals[k] = total
+                        out(f"   итого {k} реплик(и): {total:.0f} docs/s")
+                        if prev_total and total < prev_total * 1.05:
+                            out("   прирост <5%, потолок достигнут, дальше не идём")
+                            break
+                        prev_total = total
+                    if totals:
+                        out("   сводка: " + ", ".join(f"{k}: {v:.0f}" for k, v in totals.items()) + " docs/s")
         finally:
             out("\nПоднимаю сервисы обратно...")
             order = [n for n in ("bpipe", "bpipe_2", "bpipe_3", "upipe", "collector") if n in stopped]
-            rc, _ = sh(["docker", "start"] + order, timeout=120)
-            out(f"docker start {order} rc={rc}")
+            if order:
+                rc, _ = sh(["docker", "start"] + order, timeout=120)
+                out(f"docker start {order} rc={rc}")
+            else:
+                out("останавливать было нечего (система не была запущена); поднять: ./run.sh up -d")
 
     out("\n=== ИТОГ ПО ЛОГАМ ===")
-    for name in ("upipe.log", "collector_lang.log", "bpipe_sweep.log", "bpipe_conc1.log", "bpipe_conc2.log"):
+    for name in ["upipe.log", "collector_lang.log", "bpipe_sweep.log"] + [f"bpipe_conc{k}.log" for k in (1, 2, 3, 4, 6)]:
         txt = read_text(os.path.join(outdir, name))
         if txt:
             out(f"\n##### {name}\n{txt}")
