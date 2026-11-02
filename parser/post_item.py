@@ -1,3 +1,4 @@
+import html
 import json
 from datetime import datetime, timezone
 
@@ -9,6 +10,33 @@ DELETED = {"[deleted]", "[removed]", ""}
 
 def iso(ts) -> str:
     return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def extract_links(c: dict) -> list[str]:
+    urls = []
+
+    def add(u):
+        if isinstance(u, str):
+            u = html.unescape(u).strip()
+            if u.startswith(("http://", "https://")) and u not in urls:
+                urls.append(u)
+
+    add(c.get("url_overridden_by_dest"))
+    add(c.get("url"))
+    add(c.get("thumbnail"))
+    for im in (c.get("preview") or {}).get("images", []):
+        add((im.get("source") or {}).get("url"))
+        for v in (im.get("variants") or {}).values():
+            add((v.get("source") or {}).get("url"))
+    for m in (c.get("media_metadata") or {}).values():
+        if isinstance(m, dict):
+            s = m.get("s") or {}
+            add(s.get("u") or s.get("gif") or s.get("mp4"))
+    for key in ("secure_media", "media"):
+        mm = c.get(key) or {}
+        add((mm.get("reddit_video") or {}).get("fallback_url"))
+        add((mm.get("oembed") or {}).get("url"))
+    return urls
 
 
 def build_item(c: dict) -> dict | None:
@@ -24,6 +52,10 @@ def build_item(c: dict) -> dict | None:
     ext_id = c.get("name") or (("t3_" if is_post else "t1_") + c["id"])
     permalink = c.get("permalink") or ""
     url = permalink if permalink.startswith("http") else "https://www.reddit.com" + permalink
+
+    links = [u for u in extract_links(c) if u != url and u not in content and html.unescape(content).find(u) < 0]
+    if links:
+        content += "\n" + "\n".join("--" + u for u in links)
 
     summary = {
         "score": str(c.get("score", c.get("ups", ""))),
