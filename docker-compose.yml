@@ -34,6 +34,7 @@ services:
     build:
       context: ./translator
     container_name: translator
+    profiles: ["cpu-translate"]
     restart: unless-stopped
     logging: *default-logging
     cpus: "${TRANSLATOR_CPUS:-4}"
@@ -256,8 +257,6 @@ services:
     depends_on:
       bpipe:
         condition: service_healthy
-      translator:
-        condition: service_healthy
     environment:
       UPIPE_PORT:                "5981"
       BPIPE_URLS:                "${BPIPE_URLS:-http://bpipe:7995/}"
@@ -265,11 +264,11 @@ services:
       UPIPE_QUEUE_LIMIT:         "${UPIPE_QUEUE_LIMIT:-200}"
       MAX_DEPTH_CLASSIFICATION:  "${MAX_DEPTH_CLASSIFICATION:-2}"
       MAX_MODEL_TOKENS:          "${MAX_MODEL_TOKENS:-400}"
-      TRANSLATE:                 "${TRANSLATE:-false}"
+      TRANSLATE:                 "${UPIPE_TRANSLATE:-false}"
       TRANSLATOR_URL:            "http://translator:8003/"
       TRANSLATE_TIMEOUT_SECONDS: "${TRANSLATE_TIMEOUT_SECONDS:-30}"
       FOREIGN_FORWARD_URL:       "${FOREIGN_FORWARD_URL:-}"
-      GPU_TRANSLATOR_URL:        "${GPU_TRANSLATOR_URL:-}"
+      GPU_TRANSLATOR_URL:        "${GPU_TRANSLATOR_URL:-http://translator_gpu:8004/}"
       GPU_RETRY_SECONDS:         "${GPU_RETRY_SECONDS:-30}"
       UPIPE_TRANSLATED_RETRIES:  "${UPIPE_TRANSLATED_RETRIES:-6}"
       USE_PROXY:                 "${USE_PROXY_UPIPE:-false}"
@@ -284,6 +283,47 @@ services:
       timeout: 5s
       retries: 60
       start_period: 60s
+
+  translator_gpu:
+    build:
+      context: ./translator_gpu
+    container_name: translator_gpu
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      GPU_TRANSLATOR_PORT:  "8004"
+      UPIPE_URL:            "http://upipe:5981/"
+      OPUS_LANGS:           "${OPUS_LANGS:-es,pt,ja,id,hi,de,fr,ko,tr,ar,it,ru,th,vi,tl,zh,nl,pl,sv,uk,bn,ta,te,mr,ur,he,ro,el,cs,hu,da,fi,no,bg,ca,ml,gu,kn,sr,hr}"
+      OPUS_FALLBACK:        "${OPUS_FALLBACK:-}"
+      NLLB_DISABLE:         "${NLLB_DISABLE:-true}"
+      GPU_COMPUTE_TYPE:     "${GPU_COMPUTE_TYPE:-int8}"
+      GPU_BATCH_SIZE:       "${GPU_BATCH_SIZE:-2}"
+      GPU_MAX_WAIT_SECONDS: "${GPU_MAX_WAIT_SECONDS:-0.5}"
+      GPU_INFLIGHT:         "${GPU_INFLIGHT:-2}"
+      GPU_MAX_TOKENS:       "${GPU_MAX_TOKENS:-150}"
+      GPU_BEAM_SIZE:        "${GPU_BEAM_SIZE:-1}"
+      GPU_QUEUE_SIZE:       "${GPU_QUEUE_SIZE:-300}"
+      GPU_SAMPLE_PATH:      ""
+      HTTP_PROXY:           "${HF_PROXY:-}"
+      HTTPS_PROXY:          "${HF_PROXY:-}"
+    ports:
+      - "127.0.0.1:8004:8004"
+    volumes:
+      - ./models_cache:/root/.cache
+      - ./ct2_models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8004/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 240
+      start_period: 120s
 
   collector:
     build:
@@ -300,7 +340,8 @@ services:
       BPIPE_URLS:          "${BPIPE_URLS:-http://bpipe:7995/}"
       TRANSACTIONEER_URL:  "http://transactioneer:8002/"
       TRANSLATOR_URL:      "http://translator:8003/"
-      TRANSLATE:           "${TRANSLATE:-false}"
+      TRANSLATE:           "${TRANSLATE:-true}"
+      TRANSLATE_BACKEND:   "${TRANSLATE_BACKEND:-gpu}"
       TRANSLATE_MAX_CHARS: "${TRANSLATE_MAX_CHARS:-2000}"
       TRANSLATE_BUSY_FILL: "${TRANSLATE_BUSY_FILL:-0.9}"
       LANG_CONFIDENCE_THRESHOLD: "${LANG_CONFIDENCE_THRESHOLD:-0.90}"
@@ -318,7 +359,7 @@ services:
       URL_LOCAL_DEDUP:     "${URL_LOCAL_DEDUP:-true}"
       URL_DEDUP_DOMAINS:   "${URL_DEDUP_DOMAINS:-}"
       FOREIGN_FORWARD_URL: "${FOREIGN_FORWARD_URL:-}"
-      GPU_TRANSLATOR_URL:  "${GPU_TRANSLATOR_URL:-}"
+      GPU_TRANSLATOR_URL:  "${GPU_TRANSLATOR_URL:-http://translator_gpu:8004/}"
       GPU_ROUTE_REASONS:   "${GPU_ROUTE_REASONS:-queue_full}"
       GPU_RETRY_SECONDS:   "${GPU_RETRY_SECONDS:-30}"
     ports:

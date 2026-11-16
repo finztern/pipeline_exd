@@ -35,7 +35,7 @@ def read_env():
 
 ENV = read_env()
 COLLECTOR = os.getenv("COLLECTOR_URL", "http://localhost:9000").rstrip("/")
-GPU_URL = (os.getenv("GPU_TRANSLATOR_URL") or ENV.get("GPU_TRANSLATOR_URL") or "http://192.168.0.100:8004/").rstrip("/") + "/"
+GPU_URL = (os.getenv("GPU_TRANSLATOR_URL") or ENV.get("GPU_TRANSLATOR_URL") or "http://localhost:8004/").replace("//translator_gpu:", "//localhost:").rstrip("/") + "/"
 try:
     N_BPIPE = max(1, min(3, int(ENV.get("BPIPE_REPLICAS", "1"))))
 except ValueError:

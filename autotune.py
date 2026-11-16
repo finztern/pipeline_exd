@@ -15,6 +15,7 @@ from datetime import datetime
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(ROOT, ".env")
+TR_URL = os.getenv("GPU_TRANSLATOR_HOST_URL", "http://localhost:8004").rstrip("/")
 COLLECTOR = os.getenv("COLLECTOR_URL", "http://localhost:9000").rstrip("/")
 BPIPES = [("bpipe", 7995), ("bpipe_2", 7996), ("bpipe_3", 7997)]
 CANDIDATES = [2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64]
@@ -24,7 +25,7 @@ RE_DONE = re.compile(r"\[Batch-(\d+)\].*?ML готово за ([\d.]+)с")
 DEFAULTS = {
     "FIXED_BATCH_SIZE": "6", "BATCH_TIMEOUT_SECONDS": "3.0", "BPIPE_QUEUE_DEFAULT_MAX": "200",
     "BPIPE_QUEUE_TRANSLATED_MAX": "100", "BPIPE_QUEUE_TRANSLATED_HARD_MAX": "1000",
-    "UPIPE_QUEUE_LIMIT": "200", "UPIPE_WORKERS": "4", "TAG_HF_BATCH_SIZE": "64", "TAG_MAX_LENGTH": "512",
+    "UPIPE_QUEUE_LIMIT": "200", "UPIPE_WORKERS": "4", "GPU_BATCH_SIZE": "2", "GPU_INFLIGHT": "2", "TAG_HF_BATCH_SIZE": "64", "TAG_MAX_LENGTH": "512",
 }
 
 
@@ -102,7 +103,10 @@ def poll(bp):
         fc = ex.submit(http_json, COLLECTOR + "/stats")
         fb = [ex.submit(docker_json, n, f"http://localhost:{port}/health") for n, port in bp]
         fg = ex.submit(nvidia)
-        return {"t": t, "c": fc.result(), "b": [f.result() for f in fb], "gpu": fg.result(), "cpu": cpu_times()}
+        ft = ex.submit(http_json, TR_URL + "/stats")
+        fh = ex.submit(http_json, TR_URL + "/health")
+        return {"t": t, "c": fc.result(), "b": [f.result() for f in fb], "gpu": fg.result(), "cpu": cpu_times(),
+                "tr": ft.result(), "trh": fh.result()}
 
 
 def read_env():
@@ -236,7 +240,8 @@ def load_sweep(path, hf, maxlen):
 
 def plan(lam_r, svc, a, sat, vram_frac, n_cur):
     rows = [{"n": n, "t": svc.t(n), "cap": n / svc.t(n)} for n in CANDIDATES]
-    ok = [r for r in rows if r["t"] <= a.max_age * 0.25] or rows[:1]
+    big = [r for r in rows if r["n"] >= a.min_batch]
+    ok = [r for r in big if r["t"] <= a.max_age * 0.25] or big[:1] or rows[:1]
     if vram_frac > 0.9:
         ok = [r for r in ok if r["n"] <= n_cur] or ok[:1]
     if sat:
@@ -256,6 +261,8 @@ def main():
     ap.add_argument("--fill-budget", type=float, default=1.5)
     ap.add_argument("--rate", type=float, default=0.0)
     ap.add_argument("--sweep")
+    ap.add_argument("--min-batch", type=int, default=8)
+    ap.add_argument("--allow-shrink", action="store_true")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--restart", action="store_true")
     a = ap.parse_args()
@@ -319,6 +326,28 @@ def main():
         host_cpu = 100.0 * (1 - (cpu_pts[-1][1] - cpu_pts[0][1]) / (cpu_pts[-1][0] - cpu_pts[0][0]))
     up_cpu_cores = statistics.mean(up_cpu) if up_cpu else None
 
+    tr_on = any(s["tr"] for s in samples)
+    tr = {}
+    if tr_on:
+        last = next(s["tr"] for s in reversed(samples) if s["tr"])
+        wall = max(samples[-1]["t"] - samples[0]["t"], 1e-6)
+        infl = int(last.get("inflight") or 1)
+        tr_q_avg, tr_q_max = avg_max(samples, lambda s: val(s["trh"], "queue"))
+        tr = {
+            "in": rate(samples, lambda s: val(s["tr"], "stats", "received")),
+            "out": rate(samples, lambda s: val(s["tr"], "stats", "returned")),
+            "busy": delta(samples, lambda s: val(s["tr"], "gpu_busy_s")) / wall / infl,
+            "q_avg": tr_q_avg, "q_max": tr_q_max, "inflight": infl,
+            "avg_batch": last.get("avg_batch", 0),
+            "busy_rej": delta(samples, lambda s: val(s["tr"], "stats", "rejected_busy")),
+            "errors": delta(samples, lambda s: val(s["tr"], "stats", "errors")),
+            "send_errors": delta(samples, lambda s: val(s["tr"], "stats", "send_errors")),
+            "unsupported": delta(samples, lambda s: val(s["tr"], "stats", "unsupported")),
+            "too_long": delta(samples, lambda s: val(s["tr"], "stats", "too_long")),
+            "identical": delta(samples, lambda s: val(s["tr"], "stats", "identical")),
+            "langs": last.get("languages_count", 0),
+        }
+
     thr_r = r_bp_out / live_rep
     q_wait_cur = bp_q_avg / thr_r if thr_r > 0.05 else 0.0
     sat_b = bp_q_avg >= 0.5 * bp_cap_cur or bp_drop > 0
@@ -349,6 +378,11 @@ def main():
     budget = max(a.max_age - best["t"] - timeout, 1.0)
     q = max(2 * n, min(int(cap_r * budget), 1000))
     up_new_limit = max(20, min(int(math.ceil(cap_total * min(3.0, 0.2 * a.max_age))), 400))
+    hard = q * 3
+    if not a.allow_shrink:
+        q = max(q, int(cur["BPIPE_QUEUE_DEFAULT_MAX"]))
+        up_new_limit = max(up_new_limit, int(cur["UPIPE_QUEUE_LIMIT"]))
+        hard = max(q * 3, int(cur["BPIPE_QUEUE_TRANSLATED_HARD_MAX"]))
     hf = min(64, max(16, n))
     if vram_frac > 0.9:
         hf = min(hf, 32)
@@ -365,11 +399,20 @@ def main():
         "BATCH_TIMEOUT_SECONDS": timeout,
         "BPIPE_QUEUE_DEFAULT_MAX": q,
         "BPIPE_QUEUE_TRANSLATED_MAX": q,
-        "BPIPE_QUEUE_TRANSLATED_HARD_MAX": q * 3,
+        "BPIPE_QUEUE_TRANSLATED_HARD_MAX": hard,
         "UPIPE_QUEUE_LIMIT": up_new_limit,
         "UPIPE_WORKERS": workers,
         "TAG_HF_BATCH_SIZE": hf,
     }
+    gb, gi = int(cur["GPU_BATCH_SIZE"]), int(cur["GPU_INFLIGHT"])
+    if tr_on:
+        if tr["q_avg"] >= 5 or tr["busy_rej"] > 0:
+            if tr["busy"] < 0.8 and gi < 4:
+                gi += 1
+            else:
+                gb = min(gb * 2, 16)
+        new["GPU_BATCH_SIZE"] = gb
+        new["GPU_INFLIGHT"] = gi
 
     p("\n== ПОТОК (шт/с) ==")
     p(f"  collector in {r_col_in:.1f} → прошло фильтры {r_col_fwd:.1f} → upipe done {r_up_proc:.1f} → bpipe in {r_bp_in:.1f} → bpipe out {r_bp_out:.1f}")
@@ -406,6 +449,21 @@ def main():
     if lam_r > 0 and best["cap"] < lam_r * a.headroom and not sat_b:
         p(f"  - ёмкость {cap_r:.1f}/с на реплику ниже нужной {lam_r * a.headroom:.1f}/с: потолок по GPU")
     p(f"  - расчётная задержка в bpipe: типично ≈ {min(timeout, fill) / 2 + best['t']:.1f}с, худшая ≈ {timeout + best['t'] + q / cap_r:.1f}с (цель ≤ {a.max_age:.0f}с)")
+
+    if tr_on:
+        p("\n== ПЕРЕВОДЧИК (translator_gpu) ==")
+        p(f"  вход {tr['in']:.1f}/с → в upipe {tr['out']:.1f}/с · языков {tr['langs']} · средний батч {tr['avg_batch']} · inflight {tr['inflight']}")
+        p(f"  очередь avg {tr['q_avg']:.1f} / max {tr['q_max']:.0f} · занятость GPU {tr['busy'] * 100:.0f}%")
+        p(f"  за окно: busy-отказы {tr['busy_rej']:.0f} · ошибки {tr['errors']:.0f} · send_errors {tr['send_errors']:.0f} · "
+          f"unsupported {tr['unsupported']:.0f} · too_long {tr['too_long']:.0f} · identical {tr['identical']:.0f}")
+        if tr["busy_rej"] > 0 or tr["q_avg"] >= 5:
+            p("  - переводчик не успевает: " + ("не загружен на 80% → растим GPU_INFLIGHT" if tr["busy"] < 0.8 else "GPU занят → растим GPU_BATCH_SIZE"))
+        if tr["send_errors"] > 0:
+            p("  - send_errors: upipe отвечает ошибкой или не принимает pretranslated")
+        if tr["errors"] > 0:
+            p("  - ошибки перевода: смотри docker logs translator_gpu")
+    else:
+        p("\n(translator_gpu недоступен на " + TR_URL + ")")
 
     p("\n== ИЗМЕНЕНИЯ .env ==")
     for k, v in new.items():

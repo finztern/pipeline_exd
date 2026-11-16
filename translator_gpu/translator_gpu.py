@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from collections import Counter, deque
@@ -41,6 +42,7 @@ COMPUTE     = os.getenv("GPU_COMPUTE_TYPE", "int8")
 DEVICE      = os.getenv("GPU_DEVICE", "cuda")
 MODELS_DIR  = os.getenv("CT2_MODELS_DIR", "/models")
 NLLB_NAME   = os.getenv("NLLB_MODEL", "facebook/nllb-200-distilled-600M")
+NLLB_OFF    = os.getenv("NLLB_DISABLE", "").strip().lower() in ("1", "true", "yes")
 TARGET      = "eng_Latn"
 OPUS_LANGS  = (
     "af,ar,az,bg,bn,ca,cs,cy,da,de,el,es,et,eu,fi,fr,gl,hi,hu,hy,id,is,it,ja,ka,ko,"
@@ -54,6 +56,7 @@ GROUPS = {
     "gu": "inc", "pa": "inc", "ne": "inc", "kn": "dra", "ta": "dra", "te": "dra", "he": "afa",
     "so": "cus", "sw": "bnt",
 }
+DEDICATED = {"he"}
 OPUS_FALLBACK = os.getenv("OPUS_FALLBACK", "Helsinki-NLP/opus-mt-mul-en").strip()
 SAMPLE_PATH = os.getenv("GPU_SAMPLE_PATH", "").strip()
 SAMPLE_MAX  = int(os.getenv("GPU_SAMPLE_MAX", "5000"))
@@ -63,10 +66,18 @@ def _opus_map() -> dict:
     raw = os.getenv("OPUS_MODELS", "").strip()
     if raw:
         return dict(p.strip().split(":", 1) for p in raw.split(",") if ":" in p)
-    langs = (os.getenv("OPUS_LANGS", "").strip() or OPUS_LANGS).split(",")
-    m = {l.strip(): f"Helsinki-NLP/opus-mt-{l.strip()}-en" for l in langs if l.strip()}
-    m.update({l: f"Helsinki-NLP/opus-mt-{g}-en" for l, g in GROUPS.items() if l not in m})
-    m.update(pt=ROMANCE, ro=ROMANCE)
+    explicit = os.getenv("OPUS_LANGS", "").strip()
+    langs = [l.strip() for l in (explicit or OPUS_LANGS).split(",") if l.strip()]
+    if not explicit:
+        langs += [l for l in [*GROUPS, "pt", "ro"] if l not in langs]
+    m = {}
+    for l in langs:
+        if l in GROUPS and l not in DEDICATED:
+            m[l] = f"Helsinki-NLP/opus-mt-{GROUPS[l]}-en"
+        elif l in ("pt", "ro"):
+            m[l] = ROMANCE
+        else:
+            m[l] = f"Helsinki-NLP/opus-mt-{l}-en"
     return m
 
 
@@ -171,13 +182,13 @@ def _candidates(lang: str) -> list:
             out.append((OPUS_MODELS[base], False, ""))
         if OPUS_FALLBACK and (code or base in OPUS_MODELS):
             out.append((OPUS_FALLBACK, False, ""))
-    if code:
+    if code and not NLLB_OFF:
         out.append((NLLB_NAME, True, code))
     return out
 
 
 def _all_langs() -> set:
-    return set(FLORES) | set(OPUS_MODELS)
+    return set(OPUS_MODELS) if NLLB_OFF else set(FLORES) | set(OPUS_MODELS)
 
 
 def _load():
@@ -279,7 +290,8 @@ async def _process_batch(loop, backend: Backend, items: list):
         task.add_done_callback(_bg.discard)
         sent += 1
     _record_done(sent)
-    log.info(f"batch={len(items)} ok={sent} {dt:.2f}s ({len(items) / max(dt, 1e-3):.1f}/s) q={_queue.qsize()}")
+    if dt > 0.5 or _stats["batches"] % 200 == 0:
+        log.info(f"batch={len(items)} ok={sent} {dt:.2f}s ({len(items) / max(dt, 1e-3):.1f}/s) q={_queue.qsize()} batches={_stats['batches']}")
 
 
 async def _worker():
@@ -374,6 +386,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "queue": _queue.qsize() if _queue else 0,
         "max": QUEUE_SIZE,
         "opus": sorted(l for l, n in OPUS_MODELS.items() if _backends.get(n)),
+        "langs": sorted(l for l in _all_langs() if _route(l)) if _ready else [],
         "models": len([b for b in _backends.values() if b]),
         "init_error": _init_error or None,
     }, status=200 if _ready else 503)
@@ -390,11 +403,25 @@ async def handle_stats(request: web.Request) -> web.Response:
         "beam": BEAM,
         "compute": COMPUTE,
         "avg_batch": round(_stats["batched_items"] / max(1, _stats["batches"]), 1),
+        "gpu_busy_s": round(_gpu_busy, 2),
         "gpu_busy_pct": round(100 * _gpu_busy / max(1.0, time.monotonic() - _started), 1),
         "rate_per_sec": _rates(),
         "stats": _stats,
         "languages": dict(_lang_counts.most_common()),
     })
+
+
+def _log_vram():
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip().splitlines()[0]
+        used, total = [int(x) for x in out.split(",")]
+        msg = f"VRAM: {used}/{total} МБ ({100 * used // total}%), моделей: {len([b for b in _backends.values() if b])}"
+        (log.warning if used > 0.9 * total else log.info)(msg)
+    except Exception:
+        pass
 
 
 async def _init():
@@ -407,6 +434,7 @@ async def _init():
     _session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=20, keepalive_timeout=60))
     try:
         await loop.run_in_executor(None, _load)
+        await loop.run_in_executor(None, _log_vram)
     except Exception as e:
         _init_error = str(e)
         log.error(f"Инициализация упала: {e}", exc_info=True)

@@ -50,6 +50,9 @@ EN_RESCUE_RATIO     = float(os.getenv("EN_RESCUE_RATIO", "0.15"))
 GPU_TRANSLATOR_URL  = os.getenv("GPU_TRANSLATOR_URL", "").strip()
 GPU_ROUTE_REASONS   = {r.strip() for r in os.getenv("GPU_ROUTE_REASONS", "queue_full").split(",") if r.strip()}
 GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "30"))
+GPU_BACKEND         = os.getenv("TRANSLATE_BACKEND", "cpu").strip().lower() == "gpu" and bool(GPU_TRANSLATOR_URL)
+if GPU_BACKEND:
+    TRANSLATOR_URL = GPU_TRANSLATOR_URL
 
 URL_DEDUP_MODE      = os.getenv("URL_DEDUP_MODE", "shadow").strip().lower()
 URL_DEDUP_API       = os.getenv("URL_DEDUP_API", "https://url-check.exorde.network").rstrip("/")
@@ -90,7 +93,7 @@ _dom_totals = {"r": Counter(), "f": Counter()}
 _DOM_MAX = 1000
 _langs_seen: Counter = Counter()
 _foreign_reasons: Counter = Counter()
-_tr_state = {"ok": False, "fill": 1.0, "installed": frozenset()}
+_tr_state = {"ok": False, "fill": 1.0, "qmax": 1, "installed": frozenset()}
 _session: aiohttp.ClientSession | None = None
 _bg_tasks: set = set()
 _gpu_down_until = 0.0
@@ -282,15 +285,32 @@ async def _none():
     return None
 
 
+def _gpu_installed(langs) -> frozenset:
+    s = set(langs)
+    if "zh" in s:
+        s.add("zt")
+    if "no" in s or "nb" in s:
+        s.update(("no", "nb"))
+    return frozenset(s)
+
+
 async def _poll_translator():
     url = urljoin(TRANSLATOR_URL, "health")
     was_ok = None
     while True:
         data = await _get_json(url)
-        ok = bool(data and data.get("ready") and data.get("enabled"))
-        if ok:
-            _tr_state["fill"] = float(data.get("fill", 0.0))
-            _tr_state["installed"] = frozenset(data.get("installed", []))
+        if GPU_BACKEND:
+            ok = bool(data and data.get("ready"))
+            if ok:
+                qmax = int(data.get("max") or 1)
+                _tr_state["qmax"] = qmax
+                _tr_state["fill"] = int(data.get("queue", 0)) / qmax
+                _tr_state["installed"] = _gpu_installed(data.get("langs") or data.get("opus") or [])
+        else:
+            ok = bool(data and data.get("ready") and data.get("enabled"))
+            if ok:
+                _tr_state["fill"] = float(data.get("fill", 0.0))
+                _tr_state["installed"] = frozenset(data.get("installed", []))
         _tr_state["ok"] = ok
         if ok != was_ok:
             if ok:
@@ -366,6 +386,17 @@ async def handle_stats(request: web.Request) -> web.Response:
         *[_get_json(urljoin(u, "queue")) for u in BPIPE_URLS],
     )
     tr = tr or {}
+    if GPU_BACKEND and tr:
+        rps = tr.get("rate_per_sec")
+        tr = {
+            **tr,
+            "rate_per_sec": (rps.get("10m", 0.0) if isinstance(rps, dict) else (rps or 0.0)),
+            "queue_max": _tr_state["qmax"],
+            "fill": round(_tr_state["fill"], 3),
+            "installed": sorted(_tr_state["installed"]),
+            "installed_count": len(_tr_state["installed"]),
+            "languages_translated_count": tr.get("languages_count", 0),
+        }
     up_stats = (upipe_data or {}).get("stats", {})
 
     return web.json_response({
@@ -645,9 +676,12 @@ async def _process_item(item) -> str:
                 reason = _translate_block_reason(lang, prob, len(content))
             if lang is not None and reason is None:
                 item["detected_lang"] = lang
-                item["foreign_author"] = raw_item.get("author", "")
-                _stats["to_translate"] += 1
-            elif lang is not None and _gpu_route_ok(reason):
+                if GPU_BACKEND:
+                    gpu_route = True
+                else:
+                    item["foreign_author"] = raw_item.get("author", "")
+                    _stats["to_translate"] += 1
+            elif lang is not None and not GPU_BACKEND and _gpu_route_ok(reason):
                 item["detected_lang"] = lang
                 gpu_route = True
             else:
@@ -765,7 +799,7 @@ async def on_startup(app: web.Application):
         f"workers={URL_DEDUP_WORKERS} domains={URL_DEDUP_DOMAINS or 'all'}"
     )
     log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
-    log.info(f"   TRANSLATE={TRANSLATE} translator={TRANSLATOR_URL if TRANSLATE else '-'}")
+    log.info(f"   TRANSLATE={TRANSLATE} backend={'gpu' if GPU_BACKEND else 'cpu'} translator={TRANSLATOR_URL if TRANSLATE else '-'}")
     log.info(f"   GPU translator: {GPU_TRANSLATOR_URL or 'выключен'} (причины: {sorted(GPU_ROUTE_REASONS)})")
     log.info(f"   Не-{LANG_FILTER} без перевода → {FOREIGN_FORWARD_URL or 'выключено'}")
     log.info(f"   Макс. возраст твита: {MAX_OLDNESS_SECONDS}с ({MAX_OLDNESS_SECONDS/3600:.1f}ч)")

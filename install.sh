@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-2400}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-3600}"
 
 log()  { echo -e "\n\033[1;36m▶ $*\033[0m"; }
 ok()   { echo -e "\033[32m✅ $*\033[0m"; }
@@ -132,11 +132,11 @@ mkdir -p models_cache argos_data ct2_models
 touch vpn.txt proxy.txt
 ok ".env готов"
 
-log "Сборка и запуск (первый раз 10–20 минут: образы + модели HuggingFace)"
+log "Сборка и запуск (первый раз 20–40 минут: образы + модели HuggingFace + конвертация 36 opus-mt в CT2)"
 run_sh up -d --build
 
 log "Ожидание healthy"
-services=(vpn transactioneer bpipe upipe collector)
+services=(vpn transactioneer bpipe upipe translator_gpu collector)
 n="$(get_env BPIPE_REPLICAS)"; n="${n:-1}"
 [ "$n" -ge 2 ] 2>/dev/null && services+=(bpipe_2)
 [ "$n" -ge 3 ] 2>/dev/null && services+=(bpipe_3)
