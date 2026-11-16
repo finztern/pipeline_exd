@@ -307,7 +307,7 @@ services:
       HTTP_PROXY:           "${HF_PROXY:-}"
       HTTPS_PROXY:          "${HF_PROXY:-}"
     ports:
-      - "127.0.0.1:8004:8004"
+      - "127.0.0.1:${GPU_TRANSLATOR_HOST_PORT:-8004}:8004"
     volumes:
       - ./models_cache:/root/.cache
       - ./ct2_models:/models

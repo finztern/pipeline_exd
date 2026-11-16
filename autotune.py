@@ -15,7 +15,7 @@ from datetime import datetime
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(ROOT, ".env")
-TR_URL = os.getenv("GPU_TRANSLATOR_HOST_URL", "http://localhost:8004").rstrip("/")
+TR_URL = os.getenv("GPU_TRANSLATOR_HOST_URL", "").rstrip("/")
 COLLECTOR = os.getenv("COLLECTOR_URL", "http://localhost:9000").rstrip("/")
 BPIPES = [("bpipe", 7995), ("bpipe_2", 7996), ("bpipe_3", 7997)]
 CANDIDATES = [2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64]
@@ -267,7 +267,10 @@ def main():
     ap.add_argument("--restart", action="store_true")
     a = ap.parse_args()
 
+    global TR_URL
     env = read_env()
+    if not TR_URL:
+        TR_URL = "http://localhost:" + (env.get("GPU_TRANSLATOR_HOST_PORT") or "8004")
     cur = {k: env.get(k, d) for k, d in DEFAULTS.items()}
     try:
         n_rep = max(1, min(3, int(env.get("BPIPE_REPLICAS", "1") or 1)))
