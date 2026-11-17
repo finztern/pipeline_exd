@@ -294,7 +294,7 @@ services:
       GPU_TRANSLATOR_PORT:  "8004"
       UPIPE_URL:            "http://upipe:5981/"
       OPUS_LANGS:           "${OPUS_LANGS:-es,pt,ja,id,hi,de,fr,ko,tr,ar,it,ru,th,vi,tl,zh,nl,pl,sv,uk,bn,ta,te,mr,ur,he,ro,el,cs,hu,da,fi,no,bg,ca,ml,gu,kn,sr,hr}"
-      OPUS_FALLBACK:        "${OPUS_FALLBACK:-}"
+      OPUS_FALLBACK:        "${OPUS_FALLBACK:-Helsinki-NLP/opus-mt-mul-en}"
       NLLB_DISABLE:         "${NLLB_DISABLE:-true}"
       GPU_COMPUTE_TYPE:     "${GPU_COMPUTE_TYPE:-int8}"
       GPU_BATCH_SIZE:       "${GPU_BATCH_SIZE:-2}"

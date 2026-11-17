@@ -57,9 +57,9 @@ ROMANCE     = "Helsinki-NLP/opus-mt-ROMANCE-en"
 GROUPS = {
     "lt": "bat", "hr": "sla", "sl": "sla", "sr": "sla", "bs": "sla", "no": "gmq", "nb": "gmq", "nn": "gmq",
     "gu": "inc", "pa": "inc", "ne": "inc", "kn": "dra", "ta": "dra", "te": "dra", "he": "afa",
-    "so": "cus", "sw": "bnt",
+    "so": "cus", "sw": "bnt", "el": "grk",
 }
-DEDICATED = {"he"}
+DEDICATED = set()
 OPUS_FALLBACK = os.getenv("OPUS_FALLBACK", "Helsinki-NLP/opus-mt-mul-en").strip()
 SAMPLE_PATH = os.getenv("GPU_SAMPLE_PATH", "").strip()
 SAMPLE_MAX  = int(os.getenv("GPU_SAMPLE_MAX", "5000"))
@@ -130,6 +130,12 @@ def _convert(name: str, path: str):
     cmd = ([exe] if exe else [sys.executable, "-m", "ctranslate2.converters.transformers"]) + [
         "--model", name, "--output_dir", path, "--quantization", "int8", "--force",
     ]
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(name, "config.json")
+    except Exception as e:
+        if type(e).__name__ in ("RepositoryNotFoundError", "GatedRepoError", "RevisionNotFoundError", "EntryNotFoundError"):
+            raise RuntimeError(f"модель не найдена на HuggingFace: {name}")
     for attempt in (1, 2):
         t0 = time.time()
         try:
