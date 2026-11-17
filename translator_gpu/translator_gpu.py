@@ -2,9 +2,11 @@ import asyncio
 import json
 import logging
 import os
+import faulthandler
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -120,6 +122,7 @@ _stats = {
 
 
 CONVERT_TIMEOUT = int(os.getenv("CONVERT_TIMEOUT_SECONDS", "600"))
+LOAD_TIMEOUT = int(os.getenv("LOAD_TIMEOUT_SECONDS", str(2 * CONVERT_TIMEOUT + 300)))
 
 
 def _convert(name: str, path: str):
@@ -217,11 +220,29 @@ def _load():
     names = set(OPUS_MODELS.values())
     if OPUS_FALLBACK:
         names.add(OPUS_FALLBACK)
-    for name in sorted(names):
-        try:
-            _backends[name] = Backend(name, False)
-        except Exception as e:
-            log.warning(f"Opus {name} не загрузился ({type(e).__name__}: {e})")
+    total = len(names)
+    for i, name in enumerate(sorted(names), 1):
+        box = {}
+
+        def run(n=name, b=box):
+            try:
+                b["be"] = Backend(n, False)
+            except Exception as e:
+                b["err"] = e
+
+        th = threading.Thread(target=run, daemon=True)
+        t0 = time.time()
+        th.start()
+        th.join(LOAD_TIMEOUT)
+        if th.is_alive():
+            log.error(f"[{i}/{total}] {name}: загрузка зависла >{LOAD_TIMEOUT}с, пропускаю; стеки потоков:")
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        elif "err" in box:
+            e = box["err"]
+            log.warning(f"[{i}/{total}] Opus {name} не загрузился ({type(e).__name__}: {e})")
+        else:
+            _backends[name] = box["be"]
+            log.info(f"[{i}/{total}] {name} загружен за {time.time() - t0:.0f}с")
     need_nllb = False
     for lang in _all_langs():
         for name, nllb, _ in _candidates(lang):
