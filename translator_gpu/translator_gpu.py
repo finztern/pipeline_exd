@@ -442,7 +442,7 @@ async def _init():
     asyncio.create_task(_worker())
     _ready = True
     log.info(
-        f"Готов | models={len([b for b in _backends.values() if b])} nllb={"да" if _backends.get(NLLB_NAME) else "нет"} device={DEVICE}/{COMPUTE} "
+        f"Готов | models={len([b for b in _backends.values() if b])} nllb={'да' if _backends.get(NLLB_NAME) else 'нет'} device={DEVICE}/{COMPUTE} "
         f"beam={BEAM} batch={BATCH_SIZE} max_tokens={MAX_TOKENS} inflight={INFLIGHT} -> {UPIPE_URL}"
     )
 
