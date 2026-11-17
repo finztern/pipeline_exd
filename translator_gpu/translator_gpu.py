@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -118,13 +119,34 @@ _stats = {
 }
 
 
+CONVERT_TIMEOUT = int(os.getenv("CONVERT_TIMEOUT_SECONDS", "600"))
+
+
+def _convert(name: str, path: str):
+    exe = shutil.which("ct2-transformers-converter")
+    cmd = ([exe] if exe else [sys.executable, "-m", "ctranslate2.converters.transformers"]) + [
+        "--model", name, "--output_dir", path, "--quantization", "int8", "--force",
+    ]
+    for attempt in (1, 2):
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, timeout=CONVERT_TIMEOUT)
+            if r.returncode == 0 and os.path.isfile(os.path.join(path, "model.bin")):
+                log.info(f"Конвертация {name} готова за {time.time() - t0:.0f}с")
+                return
+            log.warning(f"Конвертация {name}: код {r.returncode} (попытка {attempt}/2)")
+        except subprocess.TimeoutExpired:
+            log.warning(f"Конвертация {name}: таймаут {CONVERT_TIMEOUT}с (попытка {attempt}/2)")
+    raise RuntimeError("конвертация не удалась")
+
+
 class Backend:
     def __init__(self, name: str, nllb: bool, compute: str = "", inter: int = 0):
         self.nllb = nllb
         path = os.path.join(MODELS_DIR, name.replace("/", "__"))
         if not os.path.isfile(os.path.join(path, "model.bin")):
             log.info(f"Конвертация {name} -> CT2 int8")
-            ctranslate2.converters.TransformersConverter(name).convert(path, quantization="int8", force=True)
+            _convert(name, path)
         self.tr = ctranslate2.Translator(
             path, device=DEVICE, compute_type=compute or COMPUTE, inter_threads=inter or INFLIGHT,
         )
