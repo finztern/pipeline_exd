@@ -153,7 +153,12 @@ class Backend:
         self.tr = ctranslate2.Translator(
             path, device=DEVICE, compute_type=compute or COMPUTE, inter_threads=inter or INFLIGHT,
         )
-        self.tok = AutoTokenizer.from_pretrained(name)
+        log.info(f"{name}: CT2 модель загружена, токенизатор...")
+        try:
+            self.tok = AutoTokenizer.from_pretrained(name, local_files_only=True)
+        except Exception:
+            self.tok = AutoTokenizer.from_pretrained(name)
+        log.info(f"{name}: токенизатор готов")
 
     def _encode(self, text: str, src: str) -> list:
         if self.nllb:
@@ -233,9 +238,10 @@ def _load():
         th = threading.Thread(target=run, daemon=True)
         t0 = time.time()
         th.start()
-        th.join(LOAD_TIMEOUT)
+        ready = os.path.isfile(os.path.join(MODELS_DIR, name.replace("/", "__"), "model.bin"))
+        th.join(120 if ready else LOAD_TIMEOUT)
         if th.is_alive():
-            log.error(f"[{i}/{total}] {name}: загрузка зависла >{LOAD_TIMEOUT}с, пропускаю; стеки потоков:")
+            log.error(f"[{i}/{total}] {name}: загрузка зависла, пропускаю; стеки потоков:")
             faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
         elif "err" in box:
             e = box["err"]
