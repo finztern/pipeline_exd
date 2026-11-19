@@ -40,6 +40,7 @@ BEAM        = max(1, int(os.getenv("GPU_BEAM_SIZE", "1")))
 MAX_TOKENS  = int(os.getenv("GPU_MAX_TOKENS", "150"))
 DECODE_RATIO = float(os.getenv("GPU_DECODE_RATIO", "2.0"))
 DECODE_PAD  = int(os.getenv("GPU_DECODE_PAD", "16"))
+SEND_RETRIES = max(1, int(os.getenv("GPU_SEND_RETRIES", "4")))
 NLLB_ONLY   = {x.strip().lower() for x in os.getenv("NLLB_ONLY", "").split(",") if x.strip()}
 COMPUTE     = os.getenv("GPU_COMPUTE_TYPE", "int8")
 DEVICE      = os.getenv("GPU_DEVICE", "cuda")
@@ -117,7 +118,8 @@ RATE_WINDOWS = {"10m": 600, "30m": 1800, "60m": 3600}
 _stats = {
     "received": 0, "translated": 0, "returned": 0, "identical": 0,
     "unsupported": 0, "rejected_busy": 0, "errors": 0, "send_errors": 0,
-    "batches": 0, "batched_items": 0, "too_long": 0,
+    "batches": 0, "batched_items": 0, "too_long": 0, "mul_routed": 0, "mul_identical_passed": 0,
+    "send_retries": 0,
 }
 
 
@@ -210,6 +212,8 @@ class Backend:
 
 def _candidates(lang: str) -> list:
     lang = lang.lower()
+    if lang == "mul":
+        return [(OPUS_FALLBACK, False, "")] if OPUS_FALLBACK else []
     base = lang.split("-")[0]
     code = FLORES.get(lang) or FLORES.get(base)
     out = []
@@ -276,24 +280,30 @@ def _route(lang: str):
 
 
 async def _send_back(item: dict, text: str):
-    payload = {k: v for k, v in item.items() if k != "foreign_author"}
+    payload = {k: v for k, v in item.items() if k not in ("foreign_author", "translate_route")}
     payload["pretranslated"] = text
-    try:
-        async with _session.post(
-            UPIPE_URL,
-            data=json.dumps(payload, ensure_ascii=False).encode(),
-            headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            await resp.read()
-            if 200 <= resp.status < 300:
-                _stats["returned"] += 1
-                return
-            _stats["send_errors"] += 1
-            log.warning(f"upipe вернул {resp.status} на {UPIPE_URL}")
-    except Exception as e:
-        _stats["send_errors"] += 1
-        log.warning(f"send back error -> {UPIPE_URL}: {type(e).__name__}: {e}")
+    data = json.dumps(payload, ensure_ascii=False).encode()
+    for attempt in range(SEND_RETRIES):
+        try:
+            async with _session.post(
+                UPIPE_URL,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                await resp.read()
+                if 200 <= resp.status < 300:
+                    _stats["returned"] += 1
+                    return
+                if resp.status != 503:
+                    log.warning(f"upipe вернул {resp.status} на {UPIPE_URL}")
+                    break
+        except Exception as e:
+            log.warning(f"send back error -> {UPIPE_URL}: {type(e).__name__}: {e}")
+        if attempt + 1 < SEND_RETRIES:
+            _stats["send_retries"] += 1
+            await asyncio.sleep(min(0.3 * 2 ** attempt, 3.0))
+    _stats["send_errors"] += 1
 
 
 def _record_done(n: int):
@@ -335,9 +345,13 @@ async def _process_batch(loop, backend: Backend, items: list):
             _stats["too_long"] += 1
             continue
         out = out.strip()
-        if not out or out == item["content"].strip():
+        same = out == item["content"].strip()
+        mul = item.get("translate_route") == "mul"
+        if not out or (same and not mul):
             _stats["identical"] += 1
             continue
+        if same:
+            _stats["mul_identical_passed"] += 1
         _stats["translated"] += 1
         _lang_counts[str(item.get("detected_lang", "")).lower()] += 1
         task = asyncio.create_task(_send_back(item, out))
@@ -420,7 +434,7 @@ async def handle_translate(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "bad_request"}, status=400)
 
-    route = _route(lang)
+    route = _route(str(item.get("translate_route") or lang))
     if route is None:
         _stats["unsupported"] += 1
         return web.json_response({"error": "unsupported_lang"}, status=422)
@@ -429,6 +443,8 @@ async def handle_translate(request: web.Request) -> web.Response:
         return web.json_response({"error": "queue_full"}, status=503)
 
     _stats["received"] += 1
+    if item.get("translate_route") == "mul":
+        _stats["mul_routed"] += 1
     _save_sample(lang, item["content"])
     _queue.put_nowait((item, route[0], route[1]))
     return web.Response(status=202, text="accepted")

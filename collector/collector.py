@@ -43,6 +43,8 @@ TRANSLATE_MAX_CHARS   = int(os.getenv("TRANSLATE_MAX_CHARS", "2000"))
 TRANSLATE_BUSY_FILL   = float(os.getenv("TRANSLATE_BUSY_FILL", "0.9"))
 TRANSLATE_POLL_SEC    = float(os.getenv("TRANSLATE_POLL_SECONDS", "1.0"))
 LANG_CONFIDENCE       = float(os.getenv("LANG_CONFIDENCE_THRESHOLD", "0.90"))
+LOW_CONF_ROUTE        = os.getenv("LOW_CONF_ROUTE", "true").lower() == "true"
+LOW_CONF_MIN          = float(os.getenv("LANG_LOW_CONF_MIN", "0.5"))
 
 EN_RESCUE_MIN_HITS  = int(os.getenv("EN_RESCUE_MIN_HITS", "2"))
 EN_RESCUE_RATIO     = float(os.getenv("EN_RESCUE_RATIO", "0.15"))
@@ -87,6 +89,7 @@ _stats = {
     "received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0,
     "foreign_sent": 0, "to_translate": 0, "truncated": 0, "errors": 0, "dropped": 0,
     "to_gpu": 0, "gpu_failed": 0, "filtered_time": 0, "rescued_en": 0, "filtered_url_dup": 0, "filtered_url_local": 0,
+    "low_conf_routed": 0,
 }
 _dom_buckets: deque = deque()
 _dom_totals = {"r": Counter(), "f": Counter()}
@@ -674,6 +677,14 @@ async def _process_item(item) -> str:
             if lang is not None:
                 _langs_seen[lang] += 1
                 reason = _translate_block_reason(lang, prob, len(content))
+                if (
+                    reason == "low_confidence" and GPU_BACKEND and LOW_CONF_ROUTE
+                    and len(content) <= TRANSLATE_MAX_CHARS and _tr_state["fill"] < TRANSLATE_BUSY_FILL
+                ):
+                    if prob < LOW_CONF_MIN or _norm_lang(lang) not in _tr_state["installed"]:
+                        item["translate_route"] = "mul"
+                    _stats["low_conf_routed"] += 1
+                    reason = None
             if lang is not None and reason is None:
                 item["detected_lang"] = lang
                 if GPU_BACKEND:
@@ -719,7 +730,7 @@ async def _process_item(item) -> str:
                 f"📊 recv={_stats['received']} fwd={_stats['forwarded']} "
                 f"old={_stats['filtered_old']} dup={_stats['filtered_dup']} lang={_stats['filtered_lang']} "
                 f"rescued={_stats['rescued_en']} transl={_stats['to_translate']} gpu={_stats['to_gpu']} "
-                f"foreign={_stats['foreign_sent']} dropped={_stats['dropped']}"
+                f"lowconf={_stats['low_conf_routed']} foreign={_stats['foreign_sent']} dropped={_stats['dropped']}"
             )
         return "OK"
 
@@ -801,6 +812,7 @@ async def on_startup(app: web.Application):
     log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
     log.info(f"   TRANSLATE={TRANSLATE} backend={'gpu' if GPU_BACKEND else 'cpu'} translator={TRANSLATOR_URL if TRANSLATE else '-'}")
     log.info(f"   GPU translator: {GPU_TRANSLATOR_URL or 'выключен'} (причины: {sorted(GPU_ROUTE_REASONS)})")
+    log.info(f"   low_confidence → перевод: {LOW_CONF_ROUTE} (порог языка {LOW_CONF_MIN}, ниже — mul)")
     log.info(f"   Не-{LANG_FILTER} без перевода → {FOREIGN_FORWARD_URL or 'выключено'}")
     log.info(f"   Макс. возраст твита: {MAX_OLDNESS_SECONDS}с ({MAX_OLDNESS_SECONDS/3600:.1f}ч)")
 
