@@ -229,7 +229,7 @@ def _candidates(lang: str) -> list:
 
 
 def _all_langs() -> set:
-    return set(OPUS_MODELS) if NLLB_OFF else set(FLORES) | set(OPUS_MODELS)
+    return set(OPUS_MODELS) if NLLB_OFF and not OPUS_FALLBACK else set(FLORES) | set(OPUS_MODELS)
 
 
 def _load():
