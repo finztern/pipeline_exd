@@ -85,7 +85,7 @@ def filter_english(texts):
     from exorde_data import Item, CreatedAt, Content, Domain, Url
     keep = []
     for t in texts:
-        it = Item(created_at=CreatedAt("2026-01-01T00:00:00.000Z"), content=Content(t), domain=Domain("x"), url=Url("x"))
+        it = Item(created_at=CreatedAt("2026-01-01T00:00:00.000Z"), content=Content(t), domain=Domain("x"), url=Url("https://x"))
         try:
             translate(it, [])
         except NonEnglishError:
