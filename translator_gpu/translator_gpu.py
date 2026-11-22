@@ -35,6 +35,7 @@ UPIPE_URL   = os.getenv("UPIPE_URL", "").strip()
 QUEUE_SIZE  = int(os.getenv("GPU_QUEUE_SIZE", "2000"))
 BATCH_SIZE  = max(1, int(os.getenv("GPU_BATCH_SIZE", "16")))
 MAX_WAIT    = max(0.1, float(os.getenv("GPU_MAX_WAIT_SECONDS", "5")))
+MIN_BATCH   = max(1, min(BATCH_SIZE, int(os.getenv("GPU_MIN_BATCH", "1"))))
 INFLIGHT    = max(1, int(os.getenv("GPU_INFLIGHT", "2")))
 BEAM        = max(1, int(os.getenv("GPU_BEAM_SIZE", "1")))
 MAX_TOKENS  = int(os.getenv("GPU_MAX_TOKENS", "150"))
@@ -389,11 +390,18 @@ async def _worker():
             await slots.acquire()
             held = True
             drain()
-            oldest = min(buckets.values(), key=lambda b: b["t0"])
-            if loop.time() - oldest["t0"] >= MAX_WAIT:
-                pick = oldest
-            else:
-                pick = max(buckets.values(), key=lambda b: len(b["items"]))
+            while True:
+                oldest = min(buckets.values(), key=lambda b: b["t0"])
+                age = loop.time() - oldest["t0"]
+                biggest = max(buckets.values(), key=lambda b: len(b["items"]))
+                if age >= MAX_WAIT:
+                    pick = oldest
+                    break
+                if len(biggest["items"]) >= MIN_BATCH:
+                    pick = biggest
+                    break
+                await asyncio.sleep(min(0.02, MAX_WAIT - age))
+                drain()
             del buckets[id(pick["backend"])]
             items = pick["items"]
             if len(items) > BATCH_SIZE:

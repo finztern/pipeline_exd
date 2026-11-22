@@ -299,6 +299,7 @@ services:
       GPU_COMPUTE_TYPE:     "${GPU_COMPUTE_TYPE:-int8}"
       GPU_BATCH_SIZE:       "${GPU_BATCH_SIZE:-2}"
       GPU_MAX_WAIT_SECONDS: "${GPU_MAX_WAIT_SECONDS:-0.5}"
+      GPU_MIN_BATCH:        "${GPU_MIN_BATCH:-1}"
       GPU_INFLIGHT:         "${GPU_INFLIGHT:-2}"
       GPU_MAX_TOKENS:       "${GPU_MAX_TOKENS:-150}"
       GPU_BEAM_SIZE:        "${GPU_BEAM_SIZE:-1}"
