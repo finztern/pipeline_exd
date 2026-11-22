@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 
 CMD="${1:-apply}"
 
-envget() { grep -E "^$1=" .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]'; }
+envget() { { grep -E "^$1=" .env 2>/dev/null || true; } | tail -1 | cut -d= -f2- | tr -d '[:space:]'; }
 envset() {
   grep -v -E "^$1=" .env > .env.tmp || true
   echo "$1=$2" >> .env.tmp
