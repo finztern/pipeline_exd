@@ -72,7 +72,9 @@ def _opus_map() -> dict:
     if raw:
         return dict(p.strip().split(":", 1) for p in raw.split(",") if ":" in p)
     explicit = os.getenv("OPUS_LANGS", "").strip()
-    langs = [l.strip() for l in (explicit or OPUS_LANGS).split(",") if l.strip()]
+    if explicit.lower() in ("none", "off", "-"):
+        return {}
+    langs =[l.strip() for l in (explicit or OPUS_LANGS).split(",") if l.strip()]
     if not explicit:
         langs += [l for l in [*GROUPS, "pt", "ro"] if l not in langs]
     m = {}
