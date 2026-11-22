@@ -55,6 +55,17 @@ case "$CMD" in
   stats)
     stats
     ;;
+  set)
+    shift
+    [ "$#" -ge 1 ] || { echo "использование: $0 set KEY=VAL [KEY=VAL...]" >&2; exit 1; }
+    cp .env ".env.bak.$(date +%Y%m%d_%H%M%S)"
+    for kv in "$@"; do
+      case "$kv" in *=*) envset "${kv%%=*}" "${kv#*=}" ;; *) echo "нужен формат KEY=VAL: $kv" >&2; exit 1 ;; esac
+    done
+    ./run.sh up -d --no-deps --force-recreate translator_gpu
+    wait_ready
+    echo "готово. через ~10 мин: ./tune_translator.sh stats"
+    ;;
   rollback)
     B="$(ls -1t .env.bak.* 2>/dev/null | tail -1 || true)"
     [ -n "$B" ] || { echo "нет .env.bak.*" >&2; exit 1; }
@@ -64,7 +75,7 @@ case "$CMD" in
     wait_ready
     ;;
   *)
-    echo "использование: $0 [apply|stats|rollback]" >&2
+    echo "использование: $0 [apply|stats|set KEY=VAL...|rollback]" >&2
     exit 1
     ;;
 esac
