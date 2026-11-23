@@ -8,7 +8,10 @@ import gc
 from concurrent.futures import ThreadPoolExecutor
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline
-from finvader import finvader
+from finvader import finvader  # noqa: F401 — импорт скачивает vader_lexicon
+from finvader.SentiBignomics import lexicon1
+from finvader.Henry import lexicon2
+from nltk.sentiment.vader import SentimentIntensityAnalyzer as NltkVader
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from exorde_compat import (
     Classification, LanguageScore, Sentiment, Embedding, TextType,
@@ -18,6 +21,20 @@ from exorde_compat import (
 logging.basicConfig(level=logging.INFO)
 
 _cpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tag_cpu")
+
+_fin_analyzer = None
+
+
+def _get_fin_analyzer():
+    # finvader() пересобирает лексикон и анализатор на каждый вызов; здесь та же конфигурация, но один раз
+    global _fin_analyzer
+    if _fin_analyzer is None:
+        senti = lexicon1()
+        senti.update((k, v * 0.1) for k, v in senti.items())
+        a = NltkVader()
+        a.lexicon.update({**senti, **lexicon2()})
+        _fin_analyzer = a
+    return _fin_analyzer
 
 SKIP_DEPRECATED = os.getenv("TAG_SKIP_DEPRECATED", "true").lower() == "true"
 
@@ -148,7 +165,8 @@ def tag(documents: list[str], lab_configuration):
 
     def _cpu_sentiment():
         v = [sentiment_analyzer.polarity_scores(t)["compound"] for t in documents]
-        f = [finvader(t, use_sentibignomics=True, use_henry=True, indicator='compound') for t in documents]
+        fa = _get_fin_analyzer()
+        f = [fa.polarity_scores(t)["compound"] for t in documents]
         return v, f
 
     try:
