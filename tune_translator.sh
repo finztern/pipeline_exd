@@ -31,7 +31,7 @@ stats() {
   curl -s -m 5 "$BASE/stats" | python3 -c "
 import sys,json
 d=json.load(sys.stdin);s=d['stats']
-print('compute',d['compute'],'| uptime',d['uptime_s'],'| ms/batch',round(d['gpu_busy_s']/max(1,s['batches'])*1000),'| avg_batch',d['avg_batch'],'| busy%',d['gpu_busy_pct'],'| rate',d['rate_per_sec'],'| busy_reject',s['rejected_busy'],'| unsupported',s['unsupported'],'| err',s['errors'],'| identical',s['identical'])"
+print('compute',d['compute'],'| uptime',d['uptime_s'],'| ms/batch',round(d['gpu_busy_s']/max(1,s['batches'])*1000),'| avg_batch',d['avg_batch'],'| busy%',d['gpu_busy_pct'],'| rate',d['rate_per_sec'],'| queue',d['queue'],'| busy_reject',s['rejected_busy'],'| unsupported',s['unsupported'],'| err',s['errors'],'| identical',s['identical'])"
   docker stats --no-stream translator_gpu bpipe bpipe_2 upipe collector 2>/dev/null || docker stats --no-stream translator_gpu bpipe upipe collector
 }
 
@@ -55,6 +55,34 @@ case "$CMD" in
   stats)
     stats
     ;;
+  sys)
+    python3 - <<'EOF'
+import json, re, time, urllib.request, subprocess
+def get():
+    return json.load(urllib.request.urlopen("http://127.0.0.1:9000/stats", timeout=10))
+def flat(o, p=""):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            yield from flat(v, f"{p}.{k}" if p else k)
+    elif isinstance(o, (int, float)) and not isinstance(o, bool):
+        yield p, o
+cnt = re.compile(r"(collector\.(received|forwarded|to_gpu|dropped|errors|filtered_lang|filtered_dup|low_conf_routed)|exorde\.totals\.(accepted|duplicates|rejected))$")
+gau = re.compile(r"(bpipe\.(fill|inflight|queue)|upipe\.queue|translator\.(queue|fill|rate_per_sec))$")
+a = dict(flat(get())); t0 = time.time()
+print("замер 60 с...", flush=True)
+time.sleep(60)
+b = dict(flat(get())); dt = time.time() - t0
+print("--- счётчики, /с ---")
+for k in sorted(b):
+    if cnt.search(k) and k in a:
+        print(f"{k:45s} {(b[k]-a[k])/dt:8.2f}")
+print("--- текущие значения ---")
+for k in sorted(b):
+    if gau.search(k):
+        print(f"{k:45s} {b[k]}")
+EOF
+    uptime
+    ;;
   set)
     shift
     [ "$#" -ge 1 ] || { echo "использование: $0 set KEY=VAL [KEY=VAL...]" >&2; exit 1; }
@@ -75,7 +103,7 @@ case "$CMD" in
     wait_ready
     ;;
   *)
-    echo "использование: $0 [apply|stats|set KEY=VAL...|rollback]" >&2
+    echo "использование: $0 [apply|stats|sys|set KEY=VAL...|rollback]" >&2
     exit 1
     ;;
 esac
