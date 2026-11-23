@@ -28,10 +28,24 @@ wait_ready() {
 }
 
 stats() {
-  curl -s -m 5 "$BASE/stats" | python3 -c "
-import sys,json
-d=json.load(sys.stdin);s=d['stats']
-print('compute',d['compute'],'| uptime',d['uptime_s'],'| ms/batch',round(d['gpu_busy_s']/max(1,s['batches'])*1000),'| avg_batch',d['avg_batch'],'| busy%',d['gpu_busy_pct'],'| rate',d['rate_per_sec'],'| queue',d['queue'],'| busy_reject',s['rejected_busy'],'| unsupported',s['unsupported'],'| err',s['errors'],'| identical',s['identical'])"
+  python3 - "$BASE" <<'PYEOF'
+import sys, json, time, urllib.request
+base = sys.argv[1]
+def get():
+    return json.load(urllib.request.urlopen(base + "/stats", timeout=10))
+a = get(); t0 = time.time()
+print("замер 30 с...", flush=True)
+time.sleep(30)
+b = get(); dt = time.time() - t0
+sa, sb = a["stats"], b["stats"]
+d = lambda k: (sb[k] - sa[k])
+batches = max(1, d("batches"))
+busy = b["gpu_busy_s"] - a["gpu_busy_s"]
+print("compute", b["compute"], "| uptime", b["uptime_s"], "| queue", b["queue"])
+print(f"за {dt:.0f} с: принято {d('received')/dt:.1f}/с | переведено {d('translated')/dt:.1f}/с | батчей {batches/dt:.2f}/с | "
+      f"avg_batch {d('batched_items')/batches:.1f} | ms/batch {busy/batches*1000:.0f} | busy% {busy/dt*100:.0f} (макс {100*b.get('inflight',0)}) | "
+      f"busy_reject +{d('rejected_busy')} | unsupported +{d('unsupported')} | err +{d('errors')} | identical +{d('identical')} | too_long +{d('too_long')}")
+PYEOF
   docker stats --no-stream translator_gpu bpipe bpipe_2 upipe collector 2>/dev/null || docker stats --no-stream translator_gpu bpipe upipe collector
 }
 
