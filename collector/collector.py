@@ -12,9 +12,12 @@ from urllib.parse import urljoin
 import aiohttp
 import orjson
 from aiohttp import web
-from langdetect import detect_langs, DetectorFactory, LangDetectException
+from langdetect import DetectorFactory, LangDetectException
+from langdetect import detector_factory as _ldf
 
 DetectorFactory.seed = 0
+LANGDETECT_TRIALS = max(1, int(os.getenv("LANGDETECT_TRIALS", "7")))
+_ldf.init_factory()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -250,7 +253,10 @@ def _fmt_created_at(dt: datetime) -> str:
 
 def _detect_lang(content: str) -> tuple[str | None, float]:
     try:
-        res = detect_langs(content)
+        d = _ldf._factory.create()
+        d.n_trial = LANGDETECT_TRIALS
+        d.append(content)
+        res = d.get_probabilities()
     except LangDetectException:
         return None, 0.0
     if not res:

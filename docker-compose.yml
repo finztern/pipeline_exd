@@ -355,6 +355,7 @@ services:
       QUEUE_LOW_FILL:      "${QUEUE_LOW_FILL:-0.2}"
       QUEUE_HIGH_FILL:     "${QUEUE_HIGH_FILL:-0.7}"
       LANG_FILTER:         "${LANG_FILTER:-en}"
+      LANGDETECT_TRIALS:   "${LANGDETECT_TRIALS:-7}"
       MIN_TEXT_LEN:        "${MIN_TEXT_LEN:-20}"
       MAX_TEXT_LEN:        "${MAX_TEXT_LEN:-20000}"
       MAX_OLDNESS_SECONDS: "${MAX_OLDNESS_SECONDS:-86400}"

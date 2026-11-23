@@ -93,6 +93,36 @@ def main():
         res["variants"].append({"name": name, "mean_ms": m * 1e3, "p95_ms": pct(ts, 95) * 1e3, "items_per_s": 1 / m,
                                 "speedup": base_mean / m, "agreement": agree})
 
+    from langdetect import detector_factory as ldf
+    ldf.init_factory()
+
+    def top_n(text, n):
+        try:
+            d = ldf._factory.create()
+            d.n_trial = n
+            d.append(text)
+            r = d.get_probabilities()
+        except LangDetectException:
+            return None, 0.0
+        return (r[0].lang, float(r[0].prob)) if r else (None, 0.0)
+
+    sample = texts[:1500]
+    ref = [top_n(t, 7) for t in sample]
+    print("\nLANGDETECT_TRIALS (сравнение с 7 пробами):")
+    print(f"{'trials':>7}{'мс/item':>9}{'ускорение':>11}{'совпад. языка':>15}{'prob<0.9':>10}{'prob<0.7':>10}")
+    res["trials"] = []
+    ref_ms = None
+    for n in (7, 5, 4, 3, 2):
+        t0 = time.perf_counter()
+        out = [top_n(t, n) for t in sample]
+        ms = (time.perf_counter() - t0) / len(sample) * 1e3
+        ref_ms = ref_ms or ms
+        ag = sum(1 for (a, _), (b, _) in zip(ref, out) if a == b) / len(sample)
+        l9 = sum(1 for _, p in out if p < 0.9) / len(sample)
+        l7 = sum(1 for _, p in out if p < 0.7) / len(sample)
+        print(f"{n:>7}{ms:>9.3f}{ref_ms/ms:>10.2f}x{ag*100:>14.1f}%{l9*100:>9.1f}%{l7*100:>9.1f}%")
+        res["trials"].append({"n": n, "ms": ms, "speedup": ref_ms / ms, "agreement": ag, "low09": l9, "low07": l7})
+
     buckets = {"<100": [], "100-300": [], "300-1000": [], ">1000": []}
     for tx, d in zip(texts, base_ts):
         k = len(tx)
