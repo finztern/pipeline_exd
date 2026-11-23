@@ -83,6 +83,44 @@ for k in sorted(b):
 EOF
     uptime
     ;;
+  bpipe)
+    python3 - <<'EOF'
+import json, re, subprocess, time
+REP = [("bpipe", 7995), ("bpipe_2", 7996), ("bpipe_3", 7997)]
+def get(c, p):
+    try:
+        out = subprocess.run(["docker", "exec", c, "curl", "-s", "-m", "5", f"http://localhost:{p}/health"],
+                             capture_output=True, text=True, timeout=15).stdout
+        return json.loads(out)
+    except Exception:
+        return None
+def flat(o, p=""):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            yield from flat(v, f"{p}.{k}" if p else k)
+    elif isinstance(o, (int, float)) and not isinstance(o, bool):
+        yield p, o
+cnt = re.compile(r"stats\.(received|received_translated|received_default|items_sent|batches_processed|dropped|dropped_default)$")
+gau = re.compile(r"^(queue|inflight|queues\.(default|translated)\.(queue|fill))$")
+a = {c: get(c, p) for c, p in REP}; t0 = time.time()
+print("замер 30 с...", flush=True)
+time.sleep(30)
+dt = time.time() - t0
+for c, p in REP:
+    x, y = a[c], get(c, p)
+    if not x or not y:
+        continue
+    fx, fy = dict(flat(x)), dict(flat(y))
+    print(f"--- {c} ---")
+    for k in sorted(fy):
+        if cnt.search(k) and k in fx:
+            print(f"  {k:36s} {(fy[k]-fx[k])/dt:8.2f} /с")
+    for k in sorted(fy):
+        if gau.search(k):
+            print(f"  {k:36s} {fy[k]}")
+EOF
+    docker stats --no-stream bpipe bpipe_2 translator_gpu 2>/dev/null
+    ;;
   set)
     shift
     [ "$#" -ge 1 ] || { echo "использование: $0 set KEY=VAL [KEY=VAL...]" >&2; exit 1; }
@@ -103,7 +141,7 @@ EOF
     wait_ready
     ;;
   *)
-    echo "использование: $0 [apply|stats|sys|set KEY=VAL...|rollback]" >&2
+    echo "использование: $0 [apply|stats|sys|bpipe|set KEY=VAL...|rollback]" >&2
     exit 1
     ;;
 esac
