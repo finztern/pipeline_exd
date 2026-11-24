@@ -28,7 +28,11 @@ MAIN_ADDRESS    = os.getenv("MAIN_ADDRESS", "")
 SWITCH_MARGIN   = float(os.getenv("ROUTE_SWITCH_MARGIN", "0.85"))
 FAIL_COOLDOWN   = float(os.getenv("ROUTE_FAIL_COOLDOWN", "60"))
 FAIL_COOLDOWN_MAX = 1800.0
-PROBE_PARALLEL  = 8
+PROBE_PARALLEL  = max(1, int(os.getenv("ROUTE_PROBE_PARALLEL", "32")))
+# Сколько VPN-маршрутов проверять за один цикл (сверх топа). Остальные проверяются по кругу.
+# Без лимита при сотнях узлов один цикл занимал минуты и маршрут не выбирался.
+PROBE_BATCH     = max(1, int(os.getenv("ROUTE_PROBE_BATCH", "60")))
+PROBE_TOP       = max(1, int(os.getenv("ROUTE_PROBE_TOP", "10")))
 MIN_PROBE_GAP   = 10.0
 BAD_STATUS      = {403, 407, 451, 500, 502, 503, 504}
 SOCKS_SCHEMES   = {"socks4", "socks5", "socks5h"}
@@ -84,6 +88,7 @@ class Route:
         self.name, self.kind, self.scheme = name, kind, scheme
         self.host, self.port, self.user, self.pwd = host, port, user, pwd
         self.ok = False
+        self.probed_mono = 0.0
         self.latency = None
         self.error = "не проверен"
         self.fail_until = 0.0
@@ -125,6 +130,7 @@ class RouteManager:
         self.current = None
         self.probed_at = 0.0
         self._wake = asyncio.Event()
+        self._ready = asyncio.Event()
 
     def _build(self) -> list:
         routes = []
@@ -150,7 +156,8 @@ class RouteManager:
     async def _probe_one(self, r: Route, sem: asyncio.Semaphore):
         async with sem:
             times, err = [], ""
-            for _ in range(PROBE_SAMPLES):
+            samples = PROBE_SAMPLES if r.ok else 1
+            for _ in range(samples):
                 t0 = time.perf_counter()
                 try:
                     if PROBE_POST_BYTES > 0:
@@ -179,15 +186,35 @@ class RouteManager:
             r.ok = bool(times) and not err
             r.latency = statistics.median(times) if r.ok else None
             r.error = "" if r.ok else (err or "нет ответов")
+            r.probed_mono = time.monotonic()
+            if r.ok and self.current is None:
+                self._choose()  # не ждём конца цикла: первый рабочий маршрут сразу в дело
+
+    def _probe_targets(self) -> list:
+        """Не-VPN маршруты проверяем всегда; из VPN: топ рабочих + текущий + самые давно не проверявшиеся."""
+        vpn = [r for r in self.routes if r.kind == "vpn"]
+        if len(vpn) <= PROBE_TOP + PROBE_BATCH:
+            return list(self.routes)
+        top = sorted((r for r in vpn if r.ok and r.latency is not None), key=lambda r: r.latency)[:PROBE_TOP]
+        chosen = {id(r) for r in top}
+        if self.current is not None and self.current.kind == "vpn":
+            chosen.add(id(self.current))
+        rest = sorted((r for r in vpn if id(r) not in chosen), key=lambda r: r.probed_mono)[:PROBE_BATCH]
+        chosen.update(id(r) for r in rest)
+        return [r for r in self.routes if r.kind != "vpn" or id(r) in chosen]
 
     async def probe_all(self):
         sem = asyncio.Semaphore(PROBE_PARALLEL)
-        await asyncio.gather(*(self._probe_one(r, sem) for r in self.routes))
+        targets = self._probe_targets()
+        await asyncio.gather(*(self._probe_one(r, sem) for r in targets))
         self.probed_at = time.time()
         self._choose()
-        log.info("🛣 маршруты: " + " | ".join(
-            f"{r.name}={r.latency:.0f}ms" if r.ok else f"{r.name}=✗({r.error})" for r in self.routes
-        ) + f" → активный: {self.active_name()}")
+        ok = sorted((r for r in self.routes if r.ok), key=lambda r: r.latency)
+        log.info(
+            f"🛣 проверено {len(targets)} из {len(self.routes)} маршрутов, рабочих {len(ok)}: "
+            + " | ".join(f"{r.name}={r.latency:.0f}ms" for r in ok[:10])
+            + f" → активный: {self.active_name()}"
+        )
 
     def _choose(self):
         good = sorted((r for r in self.routes if self._usable(r)), key=lambda r: r.latency)
@@ -198,6 +225,7 @@ class RouteManager:
             return
         best = good[0]
         cur = self.current
+        self._ready.set()
         if cur in good and best is not cur and best.latency >= cur.latency * SWITCH_MARGIN:
             best = cur
         if best is not cur:
@@ -228,12 +256,24 @@ class RouteManager:
             self.current = None
         self._wake.set()
 
+    async def wait_ready(self, timeout: float) -> bool:
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def run(self):
+        first = True
         while True:
-            try:
-                await asyncio.wait_for(self._wake.wait(), PROBE_INTERVAL)
-            except asyncio.TimeoutError:
-                pass
+            if not first:
+                # пока нет рабочего маршрута, не ждём полный интервал
+                wait = MIN_PROBE_GAP if self.current is None else PROBE_INTERVAL
+                try:
+                    await asyncio.wait_for(self._wake.wait(), wait)
+                except asyncio.TimeoutError:
+                    pass
+            first = False
             self._wake.clear()
             try:
                 await self.probe_all()

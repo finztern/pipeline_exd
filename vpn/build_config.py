@@ -11,6 +11,7 @@ HTTP_PORT = int(os.environ.get("HTTP_PORT", "1081"))
 BASE_PORT = int(os.environ.get("LINK_BASE_PORT", "10800"))
 LOG_LEVEL = os.environ.get("XRAY_LOG_LEVEL", "warning")
 OBS_URL = os.environ.get("OBSERVATORY_URL", "https://www.gstatic.com/generate_204")
+URLTEST_INTERVAL = os.environ.get("URLTEST_INTERVAL", "10m")
 SCHEMES = ("vless://", "hysteria2://", "hy2://")
 
 
@@ -140,7 +141,7 @@ for i, link in enumerate(links):
 if tags:
     outbounds.append({
         "type": "urltest", "tag": "auto", "outbounds": tags,
-        "url": OBS_URL, "interval": "30s", "tolerance": 50,
+        "url": OBS_URL, "interval": URLTEST_INTERVAL, "tolerance": 50,
     })
     final = "auto"
 else:

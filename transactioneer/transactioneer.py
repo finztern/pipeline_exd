@@ -240,11 +240,9 @@ async def handle_routes(request: web.Request) -> web.Response:
 
 
 async def on_startup(app: web.Application):
-    try:
-        await asyncio.wait_for(routes.probe_all(), 60)
-    except Exception as e:
-        log.error(f"❌ первичная проверка маршрутов не завершена: {e}")
     app["route_task"] = asyncio.create_task(routes.run())
+    if not await routes.wait_ready(30):
+        log.error("⚠️ за 30с ни один маршрут не прошёл проверку; проверка продолжается в фоне")
     if not MAIN_ADDRESS:
         log.error("❌ MAIN_ADDRESS не задан! Установи его в .env файле")
     else:
