@@ -11,7 +11,7 @@ HTTP_PORT = int(os.environ.get("HTTP_PORT", "1081"))
 BASE_PORT = int(os.environ.get("LINK_BASE_PORT", "10800"))
 LOG_LEVEL = os.environ.get("XRAY_LOG_LEVEL", "warning")
 OBS_URL = os.environ.get("OBSERVATORY_URL", "https://www.gstatic.com/generate_204")
-DISABLE_PQV = os.environ.get("DISABLE_PQV", "false").strip().lower() == "true"
+SCHEMES = ("vless://", "hysteria2://", "hy2://")
 
 
 def read_links():
@@ -20,13 +20,17 @@ def read_links():
         with open(VPN_FILE, encoding="utf-8") as f:
             for line in f.read().splitlines():
                 line = line.strip()
-                if line.startswith("vless://"):
+                if line.startswith(SCHEMES):
                     links.append(line)
     except OSError:
         pass
-    if not links and VLESS_URL.startswith("vless://"):
+    if not links and VLESS_URL.startswith(SCHEMES):
         links = [VLESS_URL]
     return links
+
+
+def truthy(v):
+    return str(v).lower() in ("1", "true", "yes")
 
 
 def parse_vless(url):
@@ -39,105 +43,121 @@ def parse_vless(url):
     security = q.get("security", "none")
     network = q.get("type", "tcp")
     host = q.get("host", "")
-    path = q.get("path", "/")
+    path = unquote(q.get("path", "/"))
     sni = q.get("sni") or host or server
-    fp = q.get("fp", "chrome")
 
-    user = {"id": uuid, "encryption": q.get("encryption") or "none"}
+    ob = {"type": "vless", "server": server, "server_port": port, "uuid": uuid}
     if q.get("flow") and network == "tcp":
-        user["flow"] = q["flow"]
+        ob["flow"] = q["flow"]
 
-    ss = {"network": network, "security": security}
     if network == "ws":
-        ss["wsSettings"] = {"path": path, "headers": {"Host": host} if host else {}}
+        ob["transport"] = {"type": "ws", "path": path, **({"headers": {"Host": host}} if host else {})}
     elif network == "httpupgrade":
-        ss["httpupgradeSettings"] = {"path": path, "host": host}
-    elif network in ("xhttp", "splithttp"):
-        ss["network"] = "xhttp"
-        ss["xhttpSettings"] = {"path": path, "host": host, "mode": q.get("mode", "auto")}
+        ob["transport"] = {"type": "httpupgrade", "path": path, **({"host": host} if host else {})}
     elif network == "grpc":
-        ss["grpcSettings"] = {"serviceName": q.get("serviceName", ""), "multiMode": q.get("mode") == "multi"}
+        ob["transport"] = {"type": "grpc", "service_name": q.get("serviceName", "")}
     elif network != "tcp":
-        raise ValueError(f"type={network!r} не поддерживается")
+        raise ValueError(f"type={network!r} не поддерживается sing-box")
 
     if security == "reality":
-        pbk = q.get("pbk")
-        if not pbk:
+        if not q.get("pbk"):
             raise ValueError("reality без pbk")
-        rs = {
-            "show": False,
-            "fingerprint": fp,
-            "serverName": sni,
-            "publicKey": pbk,
-            "shortId": q.get("sid", ""),
-            "spiderX": unquote(q.get("spx", "/")),
+        ob["tls"] = {
+            "enabled": True,
+            "server_name": sni,
+            "utls": {"enabled": True, "fingerprint": q.get("fp", "chrome")},
+            "reality": {"enabled": True, "public_key": q["pbk"], "short_id": q.get("sid", "")},
         }
-        if q.get("pqv") and not DISABLE_PQV:
-            rs["mldsa65Verify"] = q["pqv"]
-        ss["realitySettings"] = rs
     elif security == "tls":
-        ts = {
-            "serverName": sni,
-            "fingerprint": fp,
-            "allowInsecure": q.get("allowInsecure", q.get("insecure", "0")) in ("1", "true"),
+        tls = {
+            "enabled": True,
+            "server_name": sni,
+            "insecure": truthy(q.get("allowInsecure", q.get("insecure", "0"))),
+            "utls": {"enabled": True, "fingerprint": q.get("fp", "chrome")},
         }
         if q.get("alpn"):
-            ts["alpn"] = q["alpn"].split(",")
-        ss["tlsSettings"] = ts
+            tls["alpn"] = q["alpn"].split(",")
+        ob["tls"] = tls
     elif security != "none":
         raise ValueError(f"security={security!r} не поддерживается")
 
-    remark = unquote(p.fragment) if p.fragment else server
-    out = {
-        "protocol": "vless",
-        "settings": {"vnext": [{"address": server, "port": port, "users": [user]}]},
-        "streamSettings": ss,
+    return ob, f"{network}/{security}"
+
+
+def parse_hy2(url):
+    p = urlparse(url)
+    q = {k: v[0] for k, v in parse_qs(p.query).items()}
+    server, port = p.hostname, p.port
+    user, pwd = unquote(p.username or ""), unquote(p.password or "")
+    password = f"{user}:{pwd}" if pwd else user
+    if not (password and server and port):
+        raise ValueError("нет password/host/port")
+
+    tls = {
+        "enabled": True,
+        "server_name": q.get("sni") or server,
+        "insecure": truthy(q.get("insecure", "0")),
+        "alpn": ["h3"],
     }
-    return out, remark, f"{network}/{security}"
+    ob = {"type": "hysteria2", "server": server, "server_port": port, "password": password, "tls": tls}
+    if q.get("obfs"):
+        if q["obfs"] != "salamander":
+            raise ValueError(f"obfs={q['obfs']!r} не поддерживается")
+        ob["obfs"] = {"type": "salamander", "password": q.get("obfs-password", "")}
+    return ob, "udp/hysteria2"
+
+
+def parse_link(link):
+    if link.startswith("vless://"):
+        return parse_vless(link)
+    return parse_hy2(link)
 
 
 links = read_links()
 inbounds = [
-    {"listen": "0.0.0.0", "port": SOCKS_PORT, "protocol": "socks",
-     "settings": {"auth": "noauth", "udp": True}, "tag": "socks-in"},
-    {"listen": "0.0.0.0", "port": HTTP_PORT, "protocol": "http", "settings": {}, "tag": "http-in"},
+    {"type": "socks", "tag": "socks-in", "listen": "0.0.0.0", "listen_port": SOCKS_PORT},
+    {"type": "http", "tag": "http-in", "listen": "0.0.0.0", "listen_port": HTTP_PORT},
 ]
 outbounds = []
 rules = []
+tags = []
 
 for i, link in enumerate(links):
     try:
-        ob, remark, kind = parse_vless(link)
+        ob, kind = parse_link(link)
     except Exception as e:
         print(f"⚠️  ссылка #{i} пропущена: {e}", file=sys.stderr)
         continue
-    ob["tag"] = f"vpn-{i}"
+    tag = f"vpn-{i}"
+    ob["tag"] = tag
     outbounds.append(ob)
-    inbounds.append({"listen": "0.0.0.0", "port": BASE_PORT + i, "protocol": "socks",
-                     "settings": {"auth": "noauth", "udp": False}, "tag": f"in-{i}"})
-    rules.append({"type": "field", "inboundTag": [f"in-{i}"], "outboundTag": f"vpn-{i}"})
-    print(f"✅ vpn-{i} :{BASE_PORT + i} {remark} ({kind})")
+    tags.append(tag)
+    inbounds.append({"type": "socks", "tag": f"in-{i}", "listen": "0.0.0.0", "listen_port": BASE_PORT + i})
+    rules.append({"inbound": [f"in-{i}"], "outbound": tag})
+    remark = unquote(urlparse(link).fragment) or urlparse(link).hostname
+    print(f"✅ {tag} :{BASE_PORT + i} {remark} ({kind})")
 
-if not outbounds:
-    print("⚠️  нет рабочих vless-ссылок (vpn.txt / VLESS_URL) — общий прокси идёт напрямую", file=sys.stderr)
-    rules.append({"type": "field", "inboundTag": ["socks-in", "http-in"], "outboundTag": "direct"})
-    routing_extra = {}
+if tags:
+    outbounds.append({
+        "type": "urltest", "tag": "auto", "outbounds": tags,
+        "url": OBS_URL, "interval": "30s", "tolerance": 50,
+    })
+    final = "auto"
 else:
-    rules.append({"type": "field", "inboundTag": ["socks-in", "http-in"], "balancerTag": "auto"})
-    routing_extra = {"balancers": [{"tag": "auto", "selector": ["vpn-"], "strategy": {"type": "leastPing"}}]}
+    print("⚠️  нет рабочих ссылок (vpn.txt / VLESS_URL) — общий прокси идёт напрямую", file=sys.stderr)
+    final = "direct"
 
-outbounds += [{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "block"}]
+outbounds.append({"type": "direct", "tag": "direct"})
 
 config = {
-    "log": {"loglevel": LOG_LEVEL},
+    "log": {"level": LOG_LEVEL},
+    "dns": {"servers": [{"type": "local", "tag": "local"}]},
     "inbounds": inbounds,
     "outbounds": outbounds,
-    "routing": {"domainStrategy": "IPIfNonMatch", "rules": rules, **routing_extra},
+    "route": {"rules": rules, "final": final, "default_domain_resolver": "local"},
 }
-if len(outbounds) > 2:
-    config["observatory"] = {"subjectSelector": ["vpn-"], "probeUrl": OBS_URL, "probeInterval": "30s"}
 
 with open("/vpn/config.json", "w") as f:
     json.dump(config, f, indent=2)
 
-print(f"✅ Конфиг Xray собран: узлов={len(outbounds) - 2} из {len(links)} ссылок")
+print(f"✅ Конфиг sing-box собран: узлов={len(tags)} из {len(links)} ссылок")

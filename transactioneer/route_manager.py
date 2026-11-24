@@ -32,6 +32,7 @@ PROBE_PARALLEL  = 8
 MIN_PROBE_GAP   = 10.0
 BAD_STATUS      = {403, 407, 451, 500, 502, 503, 504}
 SOCKS_SCHEMES   = {"socks4", "socks5", "socks5h"}
+VPN_SCHEMES     = ("vless://", "hysteria2://", "hy2://")
 
 
 def _read_lines(path: str) -> list:
@@ -43,8 +44,8 @@ def _read_lines(path: str) -> list:
 
 
 def _vpn_links() -> list:
-    links = [l for l in _read_lines(VPN_FILE) if l.startswith("vless://")]
-    if not links and VLESS_URL.startswith("vless://"):
+    links = [l for l in _read_lines(VPN_FILE) if l.startswith(VPN_SCHEMES)]
+    if not links and VLESS_URL.startswith(VPN_SCHEMES):
         links = [VLESS_URL]
     return links
 
@@ -131,7 +132,8 @@ class RouteManager:
             for i, link in enumerate(_vpn_links()):
                 u = urlsplit(link)
                 remark = unquote(u.fragment) or u.hostname or ""
-                routes.append(Route(f"vpn-{i}:{remark}", "vpn", "socks5", VPN_HOST, VPN_BASE_PORT + i))
+                proto = "hy2" if u.scheme in ("hysteria2", "hy2") else "vless"
+                routes.append(Route(f"vpn-{i}:{proto}:{remark}", "vpn", "socks5", VPN_HOST, VPN_BASE_PORT + i))
         if MODE == "direct" or (MODE == "auto" and ALLOW_DIRECT):
             routes.append(Route("direct", "direct"))
         if MODE in ("auto", "proxy"):

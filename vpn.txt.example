@@ -1,2 +1,3 @@
-# по одной vless:// ссылке в строке (tls/reality; tcp, ws, httpupgrade, grpc, xhttp)
-vless://UUID@host:443?security=tls&type=httpupgrade&path=%2Fpath%2F&host=example.com&sni=example.com&fp=chrome#name
+# по одной ссылке в строке: vless:// (tls/reality; tcp, ws, httpupgrade, grpc) или hysteria2:// (hy2://)
+vless://UUID@host:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&fp=chrome&pbk=PUBKEY&sid=SID&sni=example.com#name
+hysteria2://PASSWORD@host:443?sni=example.com&obfs=salamander&obfs-password=PASS&insecure=0#name
