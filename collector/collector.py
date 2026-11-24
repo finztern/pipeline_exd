@@ -54,7 +54,7 @@ EN_RESCUE_RATIO     = float(os.getenv("EN_RESCUE_RATIO", "0.15"))
 
 GPU_TRANSLATOR_URL  = os.getenv("GPU_TRANSLATOR_URL", "").strip()
 GPU_ROUTE_REASONS   = {r.strip() for r in os.getenv("GPU_ROUTE_REASONS", "queue_full").split(",") if r.strip()}
-GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "30"))
+GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "2"))
 GPU_BACKEND         = os.getenv("TRANSLATE_BACKEND", "cpu").strip().lower() == "gpu" and bool(GPU_TRANSLATOR_URL)
 if GPU_BACKEND:
     TRANSLATOR_URL = GPU_TRANSLATOR_URL

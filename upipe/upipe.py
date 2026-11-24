@@ -36,7 +36,7 @@ TRANSLATOR_URL      = os.getenv("TRANSLATOR_URL", "http://translator:8003/")
 TRANSLATE_TIMEOUT   = float(os.getenv("TRANSLATE_TIMEOUT_SECONDS", "30"))
 FOREIGN_FORWARD_URL = os.getenv("FOREIGN_FORWARD_URL", "").strip()
 GPU_TRANSLATOR_URL  = os.getenv("GPU_TRANSLATOR_URL", "").strip()
-GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "30"))
+GPU_RETRY_SECONDS   = float(os.getenv("GPU_RETRY_SECONDS", "2"))
 TRANSLATED_RETRIES  = max(1, int(os.getenv("UPIPE_TRANSLATED_RETRIES", "6")))
 
 PASSTHROUGH_FIELDS = ("username", "summary", "userprofile_url")

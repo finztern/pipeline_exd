@@ -19,6 +19,7 @@ services:
       GPU_MAX_TOKENS:      "${GPU_MAX_TOKENS:-150}"
       GPU_BEAM_SIZE:       "${GPU_BEAM_SIZE:-1}"
       GPU_QUEUE_SIZE:      "${GPU_QUEUE_SIZE:-2000}"
+      GPU_BUCKET_CAP:      "${GPU_BUCKET_CAP:-400}"
       HTTP_PROXY:          "${HF_PROXY:-}"
       HTTPS_PROXY:         "${HF_PROXY:-}"
     ports:

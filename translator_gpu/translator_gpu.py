@@ -37,6 +37,10 @@ BATCH_SIZE  = max(1, int(os.getenv("GPU_BATCH_SIZE", "16")))
 MAX_WAIT    = max(0.1, float(os.getenv("GPU_MAX_WAIT_SECONDS", "5")))
 MIN_BATCH   = max(1, min(BATCH_SIZE, int(os.getenv("GPU_MIN_BATCH", "1"))))
 INFLIGHT    = max(1, int(os.getenv("GPU_INFLIGHT", "2")))
+# Максимум текстов, которые воркер держит в buckets (вне asyncio.Queue).
+# Без лимита drain() перекладывал бы всю очередь в buckets, очередь не заполнялась,
+# 503 не отдавался и хвост рос в RAM без ограничений.
+BUCKET_CAP  = max(BATCH_SIZE * 2, int(os.getenv("GPU_BUCKET_CAP", "400")))
 BEAM        = max(1, int(os.getenv("GPU_BEAM_SIZE", "1")))
 MAX_TOKENS  = int(os.getenv("GPU_MAX_TOKENS", "150"))
 DECODE_RATIO = float(os.getenv("GPU_DECODE_RATIO", "2.0"))
@@ -118,6 +122,7 @@ _sample_n = 0
 _lang_counts: Counter = Counter()
 _done_ts: deque = deque()
 RATE_WINDOWS = {"10m": 600, "30m": 1800, "60m": 3600}
+_bucket_items = 0  # сколько текстов сейчас лежит в buckets воркера
 _stats = {
     "received": 0, "translated": 0, "returned": 0, "identical": 0,
     "unsupported": 0, "rejected_busy": 0, "errors": 0, "send_errors": 0,
@@ -363,10 +368,11 @@ async def _process_batch(loop, backend: Backend, items: list):
         sent += 1
     _record_done(sent)
     if dt > 0.5 or _stats["batches"] % 200 == 0:
-        log.info(f"batch={len(items)} ok={sent} {dt:.2f}s ({len(items) / max(dt, 1e-3):.1f}/s) q={_queue.qsize()} batches={_stats['batches']}")
+        log.info(f"batch={len(items)} ok={sent} {dt:.2f}s ({len(items) / max(dt, 1e-3):.1f}/s) q={_queue.qsize()} backlog={_queue.qsize() + _bucket_items} batches={_stats['batches']}")
 
 
 async def _worker():
+    global _bucket_items
     loop = asyncio.get_running_loop()
     slots = asyncio.Semaphore(INFLIGHT)
     buckets: dict = {}
@@ -377,12 +383,19 @@ async def _worker():
             b = buckets[id(job[1])] = {"backend": job[1], "items": [], "t0": loop.time()}
         b["items"].append(job)
 
+    def pending() -> int:
+        return sum(len(b["items"]) for b in buckets.values())
+
     def drain():
-        while True:
+        global _bucket_items
+        n = pending()
+        while n < BUCKET_CAP:
             try:
                 add(_queue.get_nowait())
             except asyncio.QueueEmpty:
-                return
+                break
+            n += 1
+        _bucket_items = n
 
     while True:
         held = False
@@ -411,6 +424,7 @@ async def _worker():
                     "backend": pick["backend"], "items": items[BATCH_SIZE:], "t0": pick["t0"],
                 }
                 items = items[:BATCH_SIZE]
+            _bucket_items = pending()
             task = loop.create_task(_process_batch(loop, pick["backend"], items))
             task.add_done_callback(lambda _t: slots.release())
             held = False
@@ -465,6 +479,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "status": "ok" if _ready else "starting",
         "ready": _ready,
         "queue": _queue.qsize() if _queue else 0,
+        "backlog": (_queue.qsize() if _queue else 0) + _bucket_items,
         "max": QUEUE_SIZE,
         "opus": sorted(l for l, n in OPUS_MODELS.items() if _backends.get(n)),
         "langs": sorted(l for l in _all_langs() if _route(l)) if _ready else [],
@@ -478,6 +493,9 @@ async def handle_stats(request: web.Request) -> web.Response:
         "languages_count": len(_lang_counts),
         "uptime_s": int(time.monotonic() - _started),
         "queue": _queue.qsize() if _queue else 0,
+        "bucket_items": _bucket_items,
+        "bucket_cap": BUCKET_CAP,
+        "backlog": (_queue.qsize() if _queue else 0) + _bucket_items,
         "batch_size": BATCH_SIZE,
         "max_tokens": MAX_TOKENS,
         "inflight": INFLIGHT,

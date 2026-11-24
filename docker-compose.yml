@@ -269,7 +269,7 @@ services:
       TRANSLATE_TIMEOUT_SECONDS: "${TRANSLATE_TIMEOUT_SECONDS:-30}"
       FOREIGN_FORWARD_URL:       "${FOREIGN_FORWARD_URL:-}"
       GPU_TRANSLATOR_URL:        "${GPU_TRANSLATOR_URL:-http://translator_gpu:8004/}"
-      GPU_RETRY_SECONDS:         "${GPU_RETRY_SECONDS:-30}"
+      GPU_RETRY_SECONDS:         "${GPU_RETRY_SECONDS:-2}"
       UPIPE_TRANSLATED_RETRIES:  "${UPIPE_TRANSLATED_RETRIES:-6}"
       USE_PROXY:                 "${USE_PROXY_UPIPE:-false}"
       PROXY_URL:                 "http://vpn:1081"
@@ -304,6 +304,7 @@ services:
       GPU_MAX_TOKENS:       "${GPU_MAX_TOKENS:-150}"
       GPU_BEAM_SIZE:        "${GPU_BEAM_SIZE:-1}"
       GPU_QUEUE_SIZE:       "${GPU_QUEUE_SIZE:-300}"
+      GPU_BUCKET_CAP:       "${GPU_BUCKET_CAP:-400}"
       GPU_SAMPLE_PATH:      ""
       CONVERT_TIMEOUT_SECONDS: "${CONVERT_TIMEOUT_SECONDS:-600}"
       PYTHONFAULTHANDLER:   "1"
@@ -368,7 +369,7 @@ services:
       FOREIGN_FORWARD_URL: "${FOREIGN_FORWARD_URL:-}"
       GPU_TRANSLATOR_URL:  "${GPU_TRANSLATOR_URL:-http://translator_gpu:8004/}"
       GPU_ROUTE_REASONS:   "${GPU_ROUTE_REASONS:-queue_full}"
-      GPU_RETRY_SECONDS:   "${GPU_RETRY_SECONDS:-30}"
+      GPU_RETRY_SECONDS:   "${GPU_RETRY_SECONDS:-2}"
     ports:
       - "9000:9000"
     healthcheck:

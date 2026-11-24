@@ -82,4 +82,15 @@ docker compose logs upipe | grep transl=
 - Папка `translator_gpu/` запускается на втором ПК: `cd translator_gpu && cp .env.example .env && docker compose up -d --build`.
 - В `.env` второго ПК: `UPIPE_URL=http://<IP основного>:5981/`. В `.env` основного: `GPU_TRANSLATOR_URL=http://<IP второго>:8004/`.
 - Item уходит на GPU при `queue_full` (список причин: `GPU_ROUTE_REASONS`); de/fr/es/it/pt → Opus-MT, остальное → NLLB-600M; результат возвращается в upipe с полем `pretranslated`.
-- Второй ПК недоступен → `GPU_RETRY_SECONDS` (30с) item не отправляются туда, уходят на `FOREIGN_FORWARD_URL` (если задан) или отбрасываются.
+- Второй ПК недоступен → `GPU_RETRY_SECONDS` (2с) item не отправляются туда, уходят на `FOREIGN_FORWARD_URL` (если задан) или отбрасываются.
+
+## Обратное давление в translator_gpu (GPU_BUCKET_CAP)
+
+Воркер переводчика держит тексты в двух местах: `asyncio.Queue` (`GPU_QUEUE_SIZE`) и внутренние `buckets` (по моделям).
+Раньше `drain()` перекладывал **всё** из очереди в `buckets` без лимита: очередь оставалась пустой, 503 не отдавался,
+а хвост рос в RAM без ограничений. Теперь в `buckets` держится не больше `GPU_BUCKET_CAP` текстов (по умолчанию 400, минимум `2 × GPU_BATCH_SIZE`).
+Остальное остаётся в очереди; когда она заполнена, переводчик отвечает 503 (`queue_full`), и collector/upipe отправляют item дальше
+(`FOREIGN_FORWARD_URL` или отбрасывание) на `GPU_RETRY_SECONDS` (по умолчанию 2 с).
+
+Максимальный хвост = `GPU_QUEUE_SIZE + GPU_BUCKET_CAP`. В `/stats` и `/health` есть поле `backlog` (очередь + buckets),
+в `/stats` ещё `bucket_items` и `bucket_cap`. Если `backlog` постоянно упирается в потолок, а `rejected_busy` растёт, GPU не успевает за входом.
