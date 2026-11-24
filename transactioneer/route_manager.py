@@ -37,6 +37,7 @@ MIN_PROBE_GAP   = 10.0
 BAD_STATUS      = {403, 407, 451, 500, 502, 503, 504}
 SOCKS_SCHEMES   = {"socks4", "socks5", "socks5h"}
 VPN_SCHEMES     = ("vless://", "hysteria2://", "hy2://")
+HUB_SOCKS       = [x.strip() for x in os.getenv("HUB_SOCKS_URL", "").split(",") if x.strip()]
 
 
 def _read_lines(path: str) -> list:
@@ -140,6 +141,11 @@ class RouteManager:
                 remark = unquote(u.fragment) or u.hostname or ""
                 proto = "hy2" if u.scheme in ("hysteria2", "hy2") else "vless"
                 routes.append(Route(f"vpn-{i}:{proto}:{remark}", "vpn", "socks5", VPN_HOST, VPN_BASE_PORT + i))
+        if MODE in ("auto", "vpn"):
+            for url in HUB_SOCKS:
+                for scheme, host, port, user, pwd in _parse_proxy(url):
+                    if scheme in SOCKS_SCHEMES:
+                        routes.append(Route(f"hub:{host}:{port}", "vpn", scheme, host, port, user, pwd))
         if MODE == "direct" or (MODE == "auto" and ALLOW_DIRECT):
             routes.append(Route("direct", "direct"))
         if MODE in ("auto", "proxy"):

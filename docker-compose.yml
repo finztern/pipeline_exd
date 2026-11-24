@@ -7,6 +7,7 @@ x-logging: &default-logging
 services:
 
   vpn:
+    profiles: ["local-vpn"]
     build:
       context: ./vpn
     container_name: vpn
@@ -35,13 +36,11 @@ services:
     build:
       context: ./translator
     container_name: translator
+    networks: [default, vpnnet]
     profiles: ["cpu-translate"]
     restart: unless-stopped
     logging: *default-logging
     cpus: "${TRANSLATOR_CPUS:-4}"
-    depends_on:
-      vpn:
-        condition: service_started
     environment:
       TRANSLATOR_PORT:           "8003"
       TRANSLATE:                 "${TRANSLATE:-false}"
@@ -54,7 +53,7 @@ services:
       ARGOS_DEVICE_TYPE:         "cpu"
       OMP_NUM_THREADS:           "${TRANSLATOR_OMP_THREADS:-2}"
       USE_PROXY:                 "${USE_PROXY_TRANSLATOR:-true}"
-      PROXY_URL:                 "http://vpn:1081"
+      PROXY_URL:                 "${HUB_HTTP_URL:-http://vpn:1081}"
     expose:
       - "8003"
     volumes:
@@ -70,11 +69,9 @@ services:
     build:
       context: ./transactioneer
     container_name: transactioneer
+    networks: [default, vpnnet]
     restart: unless-stopped
     logging: *default-logging
-    depends_on:
-      vpn:
-        condition: service_started
     environment:
       TRANSACTIONEER_PORT: "8002"
       UPLOAD_API_URL:      "http://upload.exorde.network/v1/upload"
@@ -95,6 +92,7 @@ services:
       ROUTE_PROBE_TOP: "${ROUTE_PROBE_TOP:-10}"
       ROUTE_SWITCH_MARGIN: "${ROUTE_SWITCH_MARGIN:-0.85}"
       ROUTE_FAIL_COOLDOWN: "${ROUTE_FAIL_COOLDOWN:-60}"
+      HUB_SOCKS_URL:       "${HUB_SOCKS_URL:-}"
       ROUTE_VPN_HOST:      "vpn"
       ROUTE_VPN_BASE_PORT: "10800"
     expose:
@@ -113,6 +111,7 @@ services:
     build:
       context: ./bpipe
     container_name: bpipe
+    networks: [default, vpnnet]
     restart: unless-stopped
     logging: *default-logging
     depends_on:
@@ -137,7 +136,7 @@ services:
       CUDA_LAUNCH_BLOCKING:    "0"
       MAIN_ADDRESS:            "${MAIN_ADDRESS}"
       USE_PROXY:               "${USE_PROXY_BPIPE:-false}"
-      PROXY_URL:               "http://vpn:1081"
+      PROXY_URL:               "${HUB_HTTP_URL:-http://vpn:1081}"
     expose:
       - "7995"
     volumes:
@@ -161,6 +160,7 @@ services:
     build:
       context: ./bpipe
     container_name: bpipe_2
+    networks: [default, vpnnet]
     restart: unless-stopped
     logging: *default-logging
     depends_on:
@@ -185,7 +185,7 @@ services:
       CUDA_LAUNCH_BLOCKING:    "0"
       MAIN_ADDRESS:            "${MAIN_ADDRESS}"
       USE_PROXY:               "${USE_PROXY_BPIPE:-false}"
-      PROXY_URL:               "http://vpn:1081"
+      PROXY_URL:               "${HUB_HTTP_URL:-http://vpn:1081}"
     expose:
       - "7996"
     volumes:
@@ -209,6 +209,7 @@ services:
     build:
       context: ./bpipe
     container_name: bpipe_3
+    networks: [default, vpnnet]
     restart: unless-stopped
     logging: *default-logging
     depends_on:
@@ -233,7 +234,7 @@ services:
       CUDA_LAUNCH_BLOCKING:    "0"
       MAIN_ADDRESS:            "${MAIN_ADDRESS}"
       USE_PROXY:               "${USE_PROXY_BPIPE:-false}"
-      PROXY_URL:               "http://vpn:1081"
+      PROXY_URL:               "${HUB_HTTP_URL:-http://vpn:1081}"
     expose:
       - "7997"
     volumes:
@@ -256,6 +257,7 @@ services:
     build:
       context: ./upipe
     container_name: upipe
+    networks: [default, vpnnet]
     restart: unless-stopped
     logging: *default-logging
     depends_on:
@@ -276,7 +278,7 @@ services:
       GPU_RETRY_SECONDS:         "${GPU_RETRY_SECONDS:-2}"
       UPIPE_TRANSLATED_RETRIES:  "${UPIPE_TRANSLATED_RETRIES:-6}"
       USE_PROXY:                 "${USE_PROXY_UPIPE:-false}"
-      PROXY_URL:                 "http://vpn:1081"
+      PROXY_URL:                 "${HUB_HTTP_URL:-http://vpn:1081}"
     ports:
       - "5981:5981"
     volumes:
@@ -382,3 +384,8 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+
+networks:
+  vpnnet:
+    name: vpnnet
+    external: true
