@@ -9,9 +9,10 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     "aiohttp>=3.9.0" \
     "orjson>=3.9.0" \
-    "langdetect>=1.0.9"
+    "langdetect>=1.0.9" \
+    "fast-langdetect>=1.2.0"
 
-COPY lang_detect.py collector.py .
+COPY lang_detect.py lang_ft.py collector.py .
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:9000/health || exit 1

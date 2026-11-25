@@ -94,3 +94,23 @@ docker compose logs upipe | grep transl=
 
 Максимальный хвост = `GPU_QUEUE_SIZE + GPU_BUCKET_CAP`. В `/stats` и `/health` есть поле `backlog` (очередь + buckets),
 в `/stats` ещё `bucket_items` и `bucket_cap`. Если `backlog` постоянно упирается в потолок, а `rejected_busy` растёт, GPU не успевает за входом.
+
+## Детектор языка collector: LANG_BACKEND
+
+`LANG_BACKEND=langdetect` (по умолчанию, поведение без изменений) | `shadow` | `fasttext`.
+
+- `langdetect` — как раньше (`LANGDETECT_TRIALS` проб).
+- `shadow` — решения по-прежнему принимает langdetect, но fastText (lite, `lid.176.ftz` внутри пакета `fast-langdetect`, офлайн)
+  считается параллельно. Расхождения и скорость видны в `GET :9000/stats` → `lang_detect`
+  (`agree_pct`, `ld_en_ft_other`, `ld_other_ft_en`, `top_disagreements`, `ft_prob_hist`, `avg_us`); 1 из 100 расхождений пишется в лог (`🧪 lang-shadow`).
+- `fasttext` — решает fastText. У него своя калибровка уверенности, поэтому свои пороги: `LANG_FT_CONFIDENCE` (0.80) и
+  `LANG_FT_LOW_CONF_MIN` (0.40); подбирай по `ft_prob_hist` из shadow. Если fastText недоступен, collector откатывается на langdetect.
+  Китайский: fastText даёт только `zh`, вариант `zh-cn`/`zh-tw` определяется по набору иероглифов (`collector/lang_ft.py`).
+
+`python collector/bench_lang.py --n 3000 [--texts файл.txt]` сравнивает скорость и совпадение языка (в т.ч. fastText).
+
+## Лимит CPU-потоков bpipe: BPIPE_CPU_THREADS
+
+torch, tokenizers (rayon) и ONNX Runtime по умолчанию заводят пулы на все логические ядра, а ORT ещё и крутится вхолостую.
+`BPIPE_CPU_THREADS` (по умолчанию 2 на реплику) выставляет `OMP/MKL/OPENBLAS/RAYON_NUM_THREADS`, `torch.set_num_threads`
+и `SessionOptions` ORT (`intra_op_num_threads`, `allow_spinning=0`). Инференс идёт на GPU. Откат: `BPIPE_CPU_THREADS=8`.

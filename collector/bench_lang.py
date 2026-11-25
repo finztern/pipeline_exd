@@ -123,6 +123,23 @@ def main():
         print(f"{n:>7}{ms:>9.3f}{ref_ms/ms:>10.2f}x{ag*100:>14.1f}%{l9*100:>9.1f}%{l7*100:>9.1f}%")
         res["trials"].append({"n": n, "ms": ms, "speedup": ref_ms / ms, "agreement": ag, "low09": l9, "low07": l7})
 
+    # fastText (collector/lang_ft.py), сравнение с langdetect(7 проб) на той же выборке
+    try:
+        import lang_ft
+        lang_ft.detect("warm up the fasttext model")
+    except Exception as e:
+        print(f"\nfastText недоступен ({e}); pip install fast-langdetect")
+    else:
+        t0 = time.perf_counter()
+        ft = [lang_ft.detect(t) for t in sample]
+        ft_ms = (time.perf_counter() - t0) / len(sample) * 1e3
+        ag = sum(1 for (a, _), (b, _) in zip(ref, ft) if a == b) / len(sample)
+        l8 = sum(1 for _, p in ft if p < 0.8) / len(sample)
+        l5 = sum(1 for _, p in ft if p < 0.5) / len(sample)
+        print(f"\nfastText (lite): {ft_ms:.3f} мс/item, ускорение к 7 пробам {ref_ms / ft_ms:.1f}x, "
+              f"совпадение языка с langdetect-7 {ag*100:.1f}%, prob<0.8 {l8*100:.1f}%, prob<0.5 {l5*100:.1f}%")
+        res["fasttext"] = {"ms": ft_ms, "speedup": ref_ms / ft_ms, "agreement": ag, "low08": l8, "low05": l5}
+
     buckets = {"<100": [], "100-300": [], "300-1000": [], ">1000": []}
     for tx, d in zip(texts, base_ts):
         k = len(tx)

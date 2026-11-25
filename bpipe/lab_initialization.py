@@ -24,6 +24,44 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from finvader import finvader
 from huggingface_hub import hf_hub_download
 
+# --- Лимиты CPU-потоков ---------------------------------------------------------------------
+# По умолчанию torch/ORT/tokenizers заводят пулы на ВСЕ логические ядра и ORT ещё и «крутится
+# вхолостую» (spinning) в ожидании работы. py-spy показывает почти нулевую занятость Python (GIL ~5%),
+# а docker stats ~40-50% CPU на реплику: это нативные потоки. Инференс идёт на GPU, больше пары
+# CPU-потоков ему не нужно. BPIPE_CPU_THREADS=0 (или не задано) = ничего не менять.
+CPU_THREADS = int(os.getenv("BPIPE_CPU_THREADS", "0") or 0)
+
+
+def apply_cpu_thread_limits() -> None:
+    if CPU_THREADS <= 0:
+        logging.info("[CPU] лимиты потоков выключены (BPIPE_CPU_THREADS не задан)")
+        return
+    try:
+        torch.set_num_threads(CPU_THREADS)
+    except Exception as e:
+        logging.warning(f"[CPU] torch.set_num_threads не сработал: {e}")
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception as e:  # уже стартовал параллельный код, не критично
+        logging.info(f"[CPU] torch.set_num_interop_threads пропущен: {e}")
+    logging.info(f"[CPU] torch threads={torch.get_num_threads()}, ORT intra={CPU_THREADS} без spinning, "
+                 f"OMP={os.getenv('OMP_NUM_THREADS')}, RAYON={os.getenv('RAYON_NUM_THREADS')}")
+
+
+def ort_session_options():
+    """SessionOptions для ORT: мало потоков и без активного ожидания. None, если лимиты выключены."""
+    if CPU_THREADS <= 0:
+        return None
+    so = onnxruntime.SessionOptions()
+    so.intra_op_num_threads = CPU_THREADS
+    so.inter_op_num_threads = 1
+    so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    so.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    return so
+
+
+apply_cpu_thread_limits()
+
 
 CLASSIFICATION_BACKEND = os.getenv("CLASSIFICATION_BACKEND", "minilm_cosine").strip().lower()
 if CLASSIFICATION_BACKEND not in ("zs", "minilm_cosine"):
@@ -84,7 +122,8 @@ def initialize_models(device):
     models["sentence_transformer"] = SentenceTransformer(
         "sentence-transformers/all-MiniLM-L6-v2",
         backend="onnx",
-        model_kwargs={"provider": ort_provider},
+        model_kwargs={"provider": ort_provider,
+                      **({"session_options": _so} if (_so := ort_session_options()) is not None else {})},
     )
     clear_gpu_memory()
 

@@ -49,8 +49,32 @@ LANG_CONFIDENCE       = float(os.getenv("LANG_CONFIDENCE_THRESHOLD", "0.90"))
 LOW_CONF_ROUTE        = os.getenv("LOW_CONF_ROUTE", "true").lower() == "true"
 LOW_CONF_MIN          = float(os.getenv("LANG_LOW_CONF_MIN", "0.5"))
 
+# Бэкенд определения языка: langdetect (по умолчанию, как было) | fasttext | shadow
+# shadow: решения принимает langdetect, fastText считается параллельно, расхождения видны в /stats (lang_detect).
+LANG_BACKEND          = os.getenv("LANG_BACKEND", "langdetect").strip().lower()
+# У fastText своя калибровка уверенности (ниже, чем у langdetect на коротких/редких языках),
+# поэтому пороги отдельные. Стартовые значения; подбираются по /stats в режиме shadow.
+FT_CONFIDENCE         = float(os.getenv("LANG_FT_CONFIDENCE", "0.80"))
+FT_LOW_CONF_MIN       = float(os.getenv("LANG_FT_LOW_CONF_MIN", "0.40"))
+
 EN_RESCUE_MIN_HITS  = int(os.getenv("EN_RESCUE_MIN_HITS", "2"))
 EN_RESCUE_RATIO     = float(os.getenv("EN_RESCUE_RATIO", "0.15"))
+
+_ft = None
+if LANG_BACKEND not in ("langdetect", "fasttext", "shadow"):
+    log.warning(f"LANG_BACKEND={LANG_BACKEND!r} неизвестен, использую langdetect")
+    LANG_BACKEND = "langdetect"
+if LANG_BACKEND in ("fasttext", "shadow"):
+    try:
+        import lang_ft as _ft
+        _ft.detect("warm up the fasttext model")
+    except Exception as _e:  # нет пакета/модели -> безопасный откат на langdetect
+        log.error(f"fastText недоступен ({_e!r}), LANG_BACKEND -> langdetect")
+        _ft = None
+        LANG_BACKEND = "langdetect"
+# пороги, реально применяемые к уверенности выбранного бэкенда
+CONF_EFF         = FT_CONFIDENCE if LANG_BACKEND == "fasttext" else LANG_CONFIDENCE
+LOW_CONF_MIN_EFF = FT_LOW_CONF_MIN if LANG_BACKEND == "fasttext" else LOW_CONF_MIN
 
 GPU_TRANSLATOR_URL  = os.getenv("GPU_TRANSLATOR_URL", "").strip()
 GPU_ROUTE_REASONS   = {r.strip() for r in os.getenv("GPU_ROUTE_REASONS", "queue_full").split(",") if r.strip()}
@@ -251,7 +275,7 @@ def _fmt_created_at(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
-def _detect_lang(content: str) -> tuple[str | None, float]:
+def _detect_lang_ld(content: str) -> tuple[str | None, float]:
     try:
         d = _ldf._factory.create()
         d.n_trial = LANGDETECT_TRIALS
@@ -264,12 +288,76 @@ def _detect_lang(content: str) -> tuple[str | None, float]:
     return res[0].lang, float(res[0].prob)
 
 
+# --- shadow-сравнение langdetect и fastText (только счётчики, на решения не влияет) ---
+_shadow: Counter = Counter()
+_shadow_pairs: Counter = Counter()
+_shadow_hist = {"agree": Counter(), "disagree": Counter()}
+
+
+def _shadow_compare(content: str, ld_lang, ld_prob: float, ld_us: float) -> None:
+    t0 = time.perf_counter()
+    try:
+        ft_lang, ft_prob = _ft.detect(content)
+    except Exception:
+        _shadow["ft_errors"] += 1
+        return
+    ft_us = (time.perf_counter() - t0) * 1e6
+    _shadow["n"] += 1
+    _shadow["ld_us"] += ld_us
+    _shadow["ft_us"] += ft_us
+    bucket = f"{min(int(ft_prob * 10), 9) / 10:.1f}"
+    if ld_lang == ft_lang:
+        _shadow["agree"] += 1
+        _shadow_hist["agree"][bucket] += 1
+        return
+    _shadow_hist["disagree"][bucket] += 1
+    _shadow_pairs[f"{ld_lang}->{ft_lang}"] += 1
+    if ld_lang == "en":
+        _shadow["ld_en_ft_other"] += 1
+    elif ft_lang == "en":
+        _shadow["ld_other_ft_en"] += 1
+    _shadow["disagree"] += 1
+    if _shadow["disagree"] % 100 == 1:
+        log.info(f"🧪 lang-shadow: langdetect={ld_lang}({ld_prob:.2f}) fasttext={ft_lang}({ft_prob:.2f}) {content[:80]!r}")
+
+
+def _shadow_report() -> dict:
+    n = _shadow["n"] or 1
+    return {
+        "backend": LANG_BACKEND,
+        "n": _shadow["n"],
+        "agree_pct": round(100 * _shadow["agree"] / n, 2),
+        "ld_en_ft_other": _shadow["ld_en_ft_other"],
+        "ld_other_ft_en": _shadow["ld_other_ft_en"],
+        "ft_errors": _shadow["ft_errors"],
+        "avg_us": {"langdetect": round(_shadow["ld_us"] / n, 1), "fasttext": round(_shadow["ft_us"] / n, 1)},
+        "top_disagreements": _shadow_pairs.most_common(25),
+        "ft_prob_hist": {k: dict(sorted(v.items())) for k, v in _shadow_hist.items()},
+        "thresholds": {"conf": CONF_EFF, "low_conf_min": LOW_CONF_MIN_EFF},
+    }
+
+
+def _detect_lang(content: str) -> tuple[str | None, float]:
+    if LANG_BACKEND == "fasttext":
+        try:
+            return _ft.detect(content)
+        except Exception:
+            _shadow["ft_errors"] += 1
+            return _detect_lang_ld(content)
+    if LANG_BACKEND == "shadow":
+        t0 = time.perf_counter()
+        res = _detect_lang_ld(content)
+        _shadow_compare(content, res[0], res[1], (time.perf_counter() - t0) * 1e6)
+        return res
+    return _detect_lang_ld(content)
+
+
 def _translate_block_reason(lang: str, prob: float, length: int) -> str | None:
     if not TRANSLATE:
         return "translate_off"
     if not _tr_state["ok"]:
         return "translator_down"
-    if prob < LANG_CONFIDENCE:
+    if prob < CONF_EFF:
         return "low_confidence"
     if length > TRANSLATE_MAX_CHARS:
         return "too_long"
@@ -437,6 +525,7 @@ async def handle_stats(request: web.Request) -> web.Response:
             "translated_count": tr.get("languages_translated_count", 0),
             "installed_count": tr.get("installed_count", 0),
         },
+        "lang_detect": _shadow_report() if LANG_BACKEND != "langdetect" else {"backend": "langdetect", "trials": LANGDETECT_TRIALS},
         "bpipe": _bpipe_summary(bpipe_data),
         "upipe": {"up": upipe_data is not None, "queue": (upipe_data or {}).get("queue", 0), "limit": UPIPE_QUEUE_LIMIT, "stats": up_stats},
         "exorde": tx or {"error": "transactioneer unavailable"},
@@ -687,7 +776,7 @@ async def _process_item(item) -> str:
                     reason == "low_confidence" and GPU_BACKEND and LOW_CONF_ROUTE
                     and len(content) <= TRANSLATE_MAX_CHARS and _tr_state["fill"] < TRANSLATE_BUSY_FILL
                 ):
-                    if prob < LOW_CONF_MIN or _norm_lang(lang) not in _tr_state["installed"]:
+                    if prob < LOW_CONF_MIN_EFF or _norm_lang(lang) not in _tr_state["installed"]:
                         item["translate_route"] = "mul"
                     _stats["low_conf_routed"] += 1
                     reason = None
@@ -818,7 +907,8 @@ async def on_startup(app: web.Application):
     log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")
     log.info(f"   TRANSLATE={TRANSLATE} backend={'gpu' if GPU_BACKEND else 'cpu'} translator={TRANSLATOR_URL if TRANSLATE else '-'}")
     log.info(f"   GPU translator: {GPU_TRANSLATOR_URL or 'выключен'} (причины: {sorted(GPU_ROUTE_REASONS)})")
-    log.info(f"   low_confidence → перевод: {LOW_CONF_ROUTE} (порог языка {LOW_CONF_MIN}, ниже — mul)")
+    log.info(f"   low_confidence → перевод: {LOW_CONF_ROUTE} (порог языка {LOW_CONF_MIN_EFF}, ниже — mul)")
+    log.info(f"   Детектор языка: {LANG_BACKEND} (порог уверенности {CONF_EFF})")
     log.info(f"   Не-{LANG_FILTER} без перевода → {FOREIGN_FORWARD_URL or 'выключено'}")
     log.info(f"   Макс. возраст твита: {MAX_OLDNESS_SECONDS}с ({MAX_OLDNESS_SECONDS/3600:.1f}ч)")
 
