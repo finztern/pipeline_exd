@@ -49,7 +49,8 @@ LANG_CONFIDENCE       = float(os.getenv("LANG_CONFIDENCE_THRESHOLD", "0.90"))
 LOW_CONF_ROUTE        = os.getenv("LOW_CONF_ROUTE", "true").lower() == "true"
 LOW_CONF_MIN          = float(os.getenv("LANG_LOW_CONF_MIN", "0.5"))
 
-# Бэкенд определения языка: langdetect (по умолчанию, как было) | fasttext | shadow
+# Бэкенд определения языка: langdetect (по умолчанию, как было) | fasttext | shadow | hybrid
+# hybrid: fastText решает, если уверен (>= LANG_FT_TRUST), иначе langdetect (как раньше). Рекомендуемый режим.
 # shadow: решения принимает langdetect, fastText считается параллельно, расхождения видны в /stats (lang_detect).
 LANG_BACKEND          = os.getenv("LANG_BACKEND", "langdetect").strip().lower()
 # У fastText своя калибровка уверенности (ниже, чем у langdetect на коротких/редких языках),
@@ -61,10 +62,10 @@ EN_RESCUE_MIN_HITS  = int(os.getenv("EN_RESCUE_MIN_HITS", "2"))
 EN_RESCUE_RATIO     = float(os.getenv("EN_RESCUE_RATIO", "0.15"))
 
 _ft = None
-if LANG_BACKEND not in ("langdetect", "fasttext", "shadow"):
+if LANG_BACKEND not in ("langdetect", "fasttext", "shadow", "hybrid"):
     log.warning(f"LANG_BACKEND={LANG_BACKEND!r} неизвестен, использую langdetect")
     LANG_BACKEND = "langdetect"
-if LANG_BACKEND in ("fasttext", "shadow"):
+if LANG_BACKEND in ("fasttext", "shadow", "hybrid"):
     try:
         import lang_ft as _ft
         _ft.detect("warm up the fasttext model")
@@ -75,6 +76,19 @@ if LANG_BACKEND in ("fasttext", "shadow"):
 # пороги, реально применяемые к уверенности выбранного бэкенда
 CONF_EFF         = FT_CONFIDENCE if LANG_BACKEND == "fasttext" else LANG_CONFIDENCE
 LOW_CONF_MIN_EFF = FT_LOW_CONF_MIN if LANG_BACKEND == "fasttext" else LOW_CONF_MIN
+
+# hybrid: порог, с которого верим fastText (на реальных примерах при >=0.5 он был прав, ниже 0.5 путает короткие тексты)
+LANG_FT_TRUST     = float(os.getenv("LANG_FT_TRUST", "0.5"))
+# каждый N-й вызов в hybrid считаем оба детектора и пишем расхождение в /stats (lang_detect); 0 = выключено
+LANG_AUDIT_EVERY  = int(os.getenv("LANG_AUDIT_EVERY", "100"))
+# Очистка текста перед определением языка (media-маркеры Reddit, URL, упоминания).
+# auto = включена для hybrid/fasttext, выключена для langdetect/shadow (чтобы их поведение не менялось)
+_lc = os.getenv("LANG_CLEAN", "auto").strip().lower()
+LANG_CLEAN_ON = _lc in ("1", "true", "yes", "on") or (_lc == "auto" and LANG_BACKEND in ("hybrid", "fasttext"))
+# Тексты, где кроме ссылок/media-маркеров нет букв (напр. '<image> ‹‹media›› https://i.redd.it/x.gif'):
+# drop = отбросить без GPU (сейчас они уходят на перевод и там отбрасываются как identical), pass = пропустить как есть
+LANG_NEUTRAL_ACTION      = os.getenv("LANG_NEUTRAL_ACTION", "drop").strip().lower()
+LANG_NEUTRAL_MIN_LETTERS = int(os.getenv("LANG_NEUTRAL_MIN_LETTERS", "2"))
 
 GPU_TRANSLATOR_URL  = os.getenv("GPU_TRANSLATOR_URL", "").strip()
 GPU_ROUTE_REASONS   = {r.strip() for r in os.getenv("GPU_ROUTE_REASONS", "queue_full").split(",") if r.strip()}
@@ -116,7 +130,7 @@ _stats = {
     "received": 0, "forwarded": 0, "filtered_old": 0, "filtered_dup": 0, "filtered_lang": 0,
     "foreign_sent": 0, "to_translate": 0, "truncated": 0, "errors": 0, "dropped": 0,
     "to_gpu": 0, "gpu_failed": 0, "filtered_time": 0, "rescued_en": 0, "filtered_url_dup": 0, "filtered_url_local": 0,
-    "low_conf_routed": 0,
+    "low_conf_routed": 0, "lang_neutral": 0,
 }
 _dom_buckets: deque = deque()
 _dom_totals = {"r": Counter(), "f": Counter()}
@@ -288,20 +302,40 @@ def _detect_lang_ld(content: str) -> tuple[str | None, float]:
     return res[0].lang, float(res[0].prob)
 
 
-# --- shadow-сравнение langdetect и fastText (только счётчики, на решения не влияет) ---
+# --- очистка текста перед определением языка ---
+_MEDIA_RE = re.compile(r"\u2039\u2039media\u203a\u203a.*?\u2039\u2039/media\u203a\u203a", re.S)     # ‹‹media›› ... ‹‹/media››
+_LINKISH_RE = re.compile(r"\u2039\u2039/?media\u203a\u203a|</?[A-Za-z][A-Za-z0-9_-]{0,20}>|(?:https?://|www\.)\S+", re.I)
+_TAG_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9_-]{0,20}>")
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.I)
+_MENTION_RE = re.compile(r"@[\w.]+")
+_SPACES_RE = re.compile(r"\s+")
+
+
+def _clean_for_lang(content: str) -> str:
+    t = _MEDIA_RE.sub(" ", content)
+    t = t.replace("\u2039\u2039media\u203a\u203a", " ").replace("\u2039\u2039/media\u203a\u203a", " ")
+    t = _TAG_RE.sub(" ", t)
+    t = _URL_RE.sub(" ", t)
+    t = _MENTION_RE.sub(" ", t)
+    t = t.replace("#", " ")
+    return _SPACES_RE.sub(" ", t).strip()
+
+
+def _is_link_only(content: str) -> bool:
+    """Текст состоит из ссылок/media-маркеров, букв почти нет (языка у такого текста нет)."""
+    if not _LINKISH_RE.search(content):
+        return False
+    return sum(1 for c in _clean_for_lang(content) if c.isalpha()) < LANG_NEUTRAL_MIN_LETTERS
+
+
+# --- сравнение langdetect и fastText (shadow и аудит в hybrid; только счётчики, на решения не влияет) ---
 _shadow: Counter = Counter()
 _shadow_pairs: Counter = Counter()
 _shadow_hist = {"agree": Counter(), "disagree": Counter()}
+_hyb: Counter = Counter()   # счётчики режима hybrid
 
 
-def _shadow_compare(content: str, ld_lang, ld_prob: float, ld_us: float) -> None:
-    t0 = time.perf_counter()
-    try:
-        ft_lang, ft_prob = _ft.detect(content)
-    except Exception:
-        _shadow["ft_errors"] += 1
-        return
-    ft_us = (time.perf_counter() - t0) * 1e6
+def _shadow_record(content: str, ld_lang, ld_prob: float, ld_us: float, ft_lang, ft_prob: float, ft_us: float) -> None:
     _shadow["n"] += 1
     _shadow["ld_us"] += ld_us
     _shadow["ft_us"] += ft_us
@@ -321,9 +355,20 @@ def _shadow_compare(content: str, ld_lang, ld_prob: float, ld_us: float) -> None
         log.info(f"🧪 lang-shadow: langdetect={ld_lang}({ld_prob:.2f}) fasttext={ft_lang}({ft_prob:.2f}) {content[:80]!r}")
 
 
+def _shadow_compare(content: str, ld_lang, ld_prob: float, ld_us: float) -> None:
+    text = _clean_for_lang(content)
+    t0 = time.perf_counter()
+    try:
+        ft_lang, ft_prob = _ft.detect(text) if text else (None, 0.0)
+    except Exception:
+        _shadow["ft_errors"] += 1
+        return
+    _shadow_record(content, ld_lang, ld_prob, ld_us, ft_lang, ft_prob, (time.perf_counter() - t0) * 1e6)
+
+
 def _shadow_report() -> dict:
     n = _shadow["n"] or 1
-    return {
+    rep = {
         "backend": LANG_BACKEND,
         "n": _shadow["n"],
         "agree_pct": round(100 * _shadow["agree"] / n, 2),
@@ -334,22 +379,76 @@ def _shadow_report() -> dict:
         "top_disagreements": _shadow_pairs.most_common(25),
         "ft_prob_hist": {k: dict(sorted(v.items())) for k, v in _shadow_hist.items()},
         "thresholds": {"conf": CONF_EFF, "low_conf_min": LOW_CONF_MIN_EFF},
+        "clean": LANG_CLEAN_ON,
     }
+    if LANG_BACKEND == "hybrid":
+        hn = _hyb["n"] or 1
+        rep["hybrid"] = {
+            "calls": _hyb["n"],
+            "ft_decided_pct": round(100 * _hyb["ft"] / hn, 2),
+            "ld_fallback_pct": round(100 * _hyb["ld"] / hn, 2),
+            "avg_call_us": round(_hyb["us"] / hn, 1),
+            "trust": LANG_FT_TRUST,
+            "audit_every": LANG_AUDIT_EVERY,
+            "note": "n/agree_pct/top_disagreements/ft_prob_hist считаются по аудит-выборке (1 из audit_every), где работали оба детектора",
+        }
+    return rep
+
+
+def _ft_prob_to_ld_scale(p: float) -> float:
+    """Уверенность fastText -> шкала langdetect, чтобы существующие пороги (LANG_CONFIDENCE / LANG_LOW_CONF_MIN) работали как задумано."""
+    if p >= FT_CONFIDENCE:
+        return 1.0
+    if p >= FT_LOW_CONF_MIN:
+        return (LOW_CONF_MIN + LANG_CONFIDENCE) / 2
+    return max(0.0, LOW_CONF_MIN - 0.01)
+
+
+def _detect_lang_hybrid(content: str) -> tuple[str | None, float]:
+    t0 = time.perf_counter()
+    text = _clean_for_lang(content)
+    if not text:
+        return None, 0.0
+    _hyb["n"] += 1
+    try:
+        ft_t0 = time.perf_counter()
+        ft_lang, ft_prob = _ft.detect(text)
+        ft_us = (time.perf_counter() - ft_t0) * 1e6
+    except Exception:
+        _shadow["ft_errors"] += 1
+        _hyb["ld"] += 1
+        return _detect_lang_ld(text)
+    if ft_lang is not None and ft_prob >= LANG_FT_TRUST:
+        _hyb["ft"] += 1
+        res = (ft_lang, _ft_prob_to_ld_scale(ft_prob))
+        _hyb["us"] += (time.perf_counter() - t0) * 1e6      # до аудита: он не входит в среднюю стоимость вызова
+        if LANG_AUDIT_EVERY > 0 and _hyb["n"] % LANG_AUDIT_EVERY == 0:   # выборочный аудит: что бы сказал langdetect
+            l0 = time.perf_counter()
+            ld_lang, ld_prob = _detect_lang_ld(text)
+            _shadow_record(content, ld_lang, ld_prob, (time.perf_counter() - l0) * 1e6, ft_lang, ft_prob, ft_us)
+        return res
+    _hyb["ld"] += 1
+    res = _detect_lang_ld(text)
+    _hyb["us"] += (time.perf_counter() - t0) * 1e6
+    return res
 
 
 def _detect_lang(content: str) -> tuple[str | None, float]:
+    if LANG_BACKEND == "hybrid":
+        return _detect_lang_hybrid(content)
+    text = _clean_for_lang(content) if LANG_CLEAN_ON else content
     if LANG_BACKEND == "fasttext":
         try:
-            return _ft.detect(content)
+            return _ft.detect(text) if text else (None, 0.0)
         except Exception:
             _shadow["ft_errors"] += 1
-            return _detect_lang_ld(content)
+            return _detect_lang_ld(text)
     if LANG_BACKEND == "shadow":
         t0 = time.perf_counter()
-        res = _detect_lang_ld(content)
+        res = _detect_lang_ld(text)
         _shadow_compare(content, res[0], res[1], (time.perf_counter() - t0) * 1e6)
         return res
-    return _detect_lang_ld(content)
+    return _detect_lang_ld(text)
 
 
 def _translate_block_reason(lang: str, prob: float, length: int) -> str | None:
@@ -759,7 +858,14 @@ async def _process_item(item) -> str:
 
     gpu_route = False
     if LANG_FILTER:
-        lang, prob = _detect_lang(content)
+        if LANG_CLEAN_ON and _is_link_only(content):
+            # только ссылки/media-маркеры, языка нет; на GPU такой текст бессмыслен
+            _stats["lang_neutral"] += 1
+            if LANG_NEUTRAL_ACTION != "pass":
+                return "lang_neutral"
+            lang, prob = LANG_FILTER, 1.0
+        else:
+            lang, prob = _detect_lang(content)
         if lang == LANG_FILTER:
             item["lang_ok"] = True
         elif LANG_FILTER == "en" and _looks_english(content):

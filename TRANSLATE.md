@@ -97,12 +97,16 @@ docker compose logs upipe | grep transl=
 
 ## Детектор языка collector: LANG_BACKEND
 
-`LANG_BACKEND=langdetect` (по умолчанию, поведение без изменений) | `shadow` | `fasttext`.
+`LANG_BACKEND=langdetect` (по умолчанию, поведение без изменений) | `shadow` | `hybrid` (рекомендуется) | `fasttext`.
 
 - `langdetect` — как раньше (`LANGDETECT_TRIALS` проб).
 - `shadow` — решения по-прежнему принимает langdetect, но fastText (lite, `lid.176.ftz` внутри пакета `fast-langdetect`, офлайн)
   считается параллельно. Расхождения и скорость видны в `GET :9000/stats` → `lang_detect`
   (`agree_pct`, `ld_en_ft_other`, `ld_other_ft_en`, `top_disagreements`, `ft_prob_hist`, `avg_us`); 1 из 100 расхождений пишется в лог (`🧪 lang-shadow`).
+- `hybrid` — fastText решает, если его уверенность >= `LANG_FT_TRUST` (0.5), иначе решает langdetect (как раньше). На реальных примерах fastText при >=0.5
+  был прав, ниже 0.5 путает короткие тексты (индонезийский принимает за английский), а на тексте без букв (эмодзи) возвращает `en`: поэтому чистый `fasttext` не рекомендуется.
+  Каждый `LANG_AUDIT_EVERY`-й вызов дополнительно считается langdetect, расхождения копятся в `/stats` → `lang_detect` (по аудит-выборке).
+  Уверенность fastText приводится к шкале langdetect (`_ft_prob_to_ld_scale`), поэтому пороги `LANG_CONFIDENCE_THRESHOLD` / `LANG_LOW_CONF_MIN` работают как раньше.
 - `fasttext` — решает fastText. У него своя калибровка уверенности, поэтому свои пороги: `LANG_FT_CONFIDENCE` (0.80) и
   `LANG_FT_LOW_CONF_MIN` (0.40); подбирай по `ft_prob_hist` из shadow. Если fastText недоступен, collector откатывается на langdetect.
   Китайский: fastText даёт только `zh`, вариант `zh-cn`/`zh-tw` определяется по набору иероглифов (`collector/lang_ft.py`).
@@ -114,3 +118,17 @@ docker compose logs upipe | grep transl=
 torch, tokenizers (rayon) и ONNX Runtime по умолчанию заводят пулы на все логические ядра, а ORT ещё и крутится вхолостую.
 `BPIPE_CPU_THREADS` (по умолчанию 2 на реплику) выставляет `OMP/MKL/OPENBLAS/RAYON_NUM_THREADS`, `torch.set_num_threads`
 и `SessionOptions` ORT (`intra_op_num_threads`, `allow_spinning=0`). Инференс идёт на GPU. Откат: `BPIPE_CPU_THREADS=8`.
+
+### Очистка текста (LANG_CLEAN) и тексты без языка
+
+Перед определением языка из текста убираются `‹‹media›› ... ‹‹/media››`, теги вроде `<image>`, URL, упоминания и `#`
+(сам текст в item не меняется). Без этого, например, `https://i.redd.it/...` определялся как итальянский (домен `.it`).
+Включена по умолчанию для `hybrid`/`fasttext` (`LANG_CLEAN=auto`), для `langdetect`/`shadow` выключена, чтобы их поведение не менялось.
+
+Если после очистки букв почти нет (< `LANG_NEUTRAL_MIN_LETTERS`), а в исходнике были ссылки/маркеры, это «текст без языка»
+(`/stats` → `lang_neutral`). `LANG_NEUTRAL_ACTION=drop` (по умолчанию): такие элементы не отправляются на GPU. Раньше они доходили
+до переводчика, где результат совпадал с исходником и отбрасывался как `identical`, то есть итог тот же, но без траты GPU.
+`LANG_NEUTRAL_ACTION=pass`: пропускать их дальше как английские.
+
+Заметка: переводчик отбрасывает результат, совпавший с исходником (`identical`, кроме маршрута `mul`). Английский текст,
+ошибочно принятый за чужой, поэтому в части случаев терялся; hybrid такие тексты отправляет дальше как английские.
