@@ -12,11 +12,14 @@ from aiohttp_socks import ProxyConnector
 
 log = logging.getLogger("routes")
 
-MODE            = os.getenv("ROUTE_MODE", "auto").strip().lower()
-ALLOW_DIRECT    = os.getenv("ROUTE_ALLOW_DIRECT", "true").lower() == "true"
-VPN_FILE        = os.getenv("ROUTE_VPN_FILE", "/data/vpn.txt")
+# VPN_MANAGED=true: узлы по подписке выбирает и держит контейнер vpn (vpn/manager.py), транзакционер ходит через его
+# единый вход (socks5h://vpn:1080) и только через него: без прямого выхода и без собственных маршрутов по узлам.
+VPN_MANAGED     = os.getenv("VPN_MANAGED", "false").lower() in ("1", "true", "yes")
+MODE            = "vpn" if VPN_MANAGED else os.getenv("ROUTE_MODE", "auto").strip().lower()
+ALLOW_DIRECT    = False if VPN_MANAGED else os.getenv("ROUTE_ALLOW_DIRECT", "true").lower() == "true"
+VPN_FILE        = "" if VPN_MANAGED else os.getenv("ROUTE_VPN_FILE", "/data/vpn.txt")
 PROXY_FILE      = os.getenv("ROUTE_PROXY_FILE", "/data/proxy.txt")
-VLESS_URL       = os.getenv("VLESS_URL", "").strip()
+VLESS_URL       = "" if VPN_MANAGED else os.getenv("VLESS_URL", "").strip()
 VPN_HOST        = os.getenv("ROUTE_VPN_HOST", "vpn")
 VPN_BASE_PORT   = int(os.getenv("ROUTE_VPN_BASE_PORT", "10800"))
 PROBE_INTERVAL  = float(os.getenv("ROUTE_PROBE_INTERVAL", "300"))
@@ -38,6 +41,8 @@ BAD_STATUS      = {403, 407, 451, 500, 502, 503, 504}
 SOCKS_SCHEMES   = {"socks4", "socks5", "socks5h"}
 VPN_SCHEMES     = ("vless://", "hysteria2://", "hy2://")
 HUB_SOCKS       = [x.strip() for x in os.getenv("HUB_SOCKS_URL", "").split(",") if x.strip()]
+if VPN_MANAGED and not HUB_SOCKS:
+    HUB_SOCKS = ["socks5h://vpn:1080"]
 
 
 def _read_lines(path: str) -> list:

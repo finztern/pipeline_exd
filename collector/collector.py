@@ -99,6 +99,11 @@ if GPU_BACKEND:
 
 URL_DEDUP_MODE      = os.getenv("URL_DEDUP_MODE", "shadow").strip().lower()
 URL_DEDUP_API       = os.getenv("URL_DEDUP_API", "https://url-check.exorde.network").rstrip("/")
+# Все внешние запросы collector (проверка URL в API Exorde) идут через VPN: URL_DEDUP_PROXY=http://vpn:1081;
+# при VPN_MANAGED=true по умолчанию HUB_HTTP_URL (или http://vpn:1081)
+URL_DEDUP_PROXY     = os.getenv("URL_DEDUP_PROXY", "").strip() or (
+    os.getenv("HUB_HTTP_URL", "").strip() or "http://vpn:1081"
+    if os.getenv("VPN_MANAGED", "false").lower() in ("1", "true", "yes") else "")
 URL_DEDUP_BATCH     = max(1, int(os.getenv("URL_DEDUP_BATCH", "48")))
 URL_DEDUP_WORKERS   = max(1, int(os.getenv("URL_DEDUP_WORKERS", "4")))
 URL_DEDUP_FLUSH_SEC = float(os.getenv("URL_DEDUP_FLUSH_SECONDS", "0.1"))
@@ -710,6 +715,7 @@ async def _url_flush(batch: list):
             data=orjson.dumps({"urls": urls}),
             headers={"Content-Type": "application/json"},
             timeout=aiohttp.ClientTimeout(total=URL_DEDUP_TIMEOUT),
+            proxy=URL_DEDUP_PROXY or None,
         ) as resp:
             body = await resp.read()
             if resp.status != 200:
@@ -1007,7 +1013,7 @@ async def on_startup(app: web.Application):
     log.info(f"   Пересылает в upipe: {UPIPE_URL}")
     log.info(f"   Опрос очередей bpipe: {BPIPE_URLS}")
     log.info(
-        f"   URL dedup: {URL_DEDUP_MODE} api={URL_DEDUP_API} batch={URL_DEDUP_BATCH} "
+        f"   URL dedup: {URL_DEDUP_MODE} api={URL_DEDUP_API}{' via ' + URL_DEDUP_PROXY if URL_DEDUP_PROXY else ''} batch={URL_DEDUP_BATCH} "
         f"workers={URL_DEDUP_WORKERS} domains={URL_DEDUP_DOMAINS or 'all'}"
     )
     log.info(f"   Языковой фильтр: {LANG_FILTER or 'выключен'}")

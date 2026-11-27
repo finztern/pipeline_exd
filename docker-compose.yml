@@ -20,17 +20,34 @@ services:
       DISABLE_PQV:   "${VPN_DISABLE_PQV:-false}"
       XRAY_LOG_LEVEL: "${VPN_LOG_LEVEL:-warning}"
       URLTEST_INTERVAL: "${VPN_URLTEST_INTERVAL:-10m}"
+      VPN_PCS_INSECURE: "${VPN_PCS_INSECURE:-true}"
+      # --- управляемый режим (если SUBSCRIPTION_URL задан): подписка + автовыбор узлов по API + запас + failover
+      SUBSCRIPTION_URL: "${SUBSCRIPTION_URL:-}"
+      SUB_INTERVAL:     "${SUB_INTERVAL:-1800}"
+      SUB_USER_AGENT:   "${SUB_USER_AGENT:-v2rayN/7.0}"
+      API_URL:          "${VPN_API_URL:-http://upload.exorde.network/v1/upload}"
+      MAIN_ADDRESS:     "${MAIN_ADDRESS}"
+      MEASURE_INTERVAL: "${VPN_MEASURE_INTERVAL:-600}"
+      MEASURE_PARALLEL: "${VPN_MEASURE_PARALLEL:-24}"
+      MEASURE_TIMEOUT:  "${VPN_MEASURE_TIMEOUT:-8}"
+      TOP_K:            "${VPN_TOP_K:-5}"
+      TOP_M:            "${VPN_TOP_M:-12}"
+      SWITCH_MARGIN:    "${VPN_SWITCH_MARGIN:-0.8}"
+      WATCH_INTERVAL:   "${VPN_WATCH_INTERVAL:-5}"
+      NODE_COOLDOWN:    "${VPN_NODE_COOLDOWN:-300}"
     volumes:
       - ./vpn.txt:/vpn/vpn.txt:ro
+      - vpn_state:/state
     ports:
       - "127.0.0.1:1080:1080"
       - "127.0.0.1:1081:1081"
+      - "127.0.0.1:9091:9091"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "-x", "socks5h://127.0.0.1:1080", "https://www.gstatic.com/generate_204", "-o", "/dev/null"]
+      test: ["CMD", "/vpn/healthcheck.sh"]
       interval: 15s
       timeout: 8s
       retries: 8
-      start_period: 10s
+      start_period: 90s
 
   translator:
     build:
@@ -93,6 +110,7 @@ services:
       ROUTE_SWITCH_MARGIN: "${ROUTE_SWITCH_MARGIN:-0.85}"
       ROUTE_FAIL_COOLDOWN: "${ROUTE_FAIL_COOLDOWN:-60}"
       HUB_SOCKS_URL:       "${HUB_SOCKS_URL:-}"
+      VPN_MANAGED:         "${VPN_MANAGED:-false}"
       ROUTE_VPN_HOST:      "vpn"
       ROUTE_VPN_BASE_PORT: "10800"
     expose:
@@ -379,6 +397,9 @@ services:
       LANG_FILTER:         "${LANG_FILTER:-en}"
       LANGDETECT_TRIALS:   "${LANGDETECT_TRIALS:-7}"
       LANG_BACKEND:        "${LANG_BACKEND:-langdetect}"
+      VPN_MANAGED:         "${VPN_MANAGED:-false}"
+      HUB_HTTP_URL:        "${HUB_HTTP_URL:-}"
+      URL_DEDUP_PROXY:     "${URL_DEDUP_PROXY:-}"
       LANG_FT_CONFIDENCE:  "${LANG_FT_CONFIDENCE:-0.80}"
       LANG_FT_LOW_CONF_MIN: "${LANG_FT_LOW_CONF_MIN:-0.40}"
       LANG_FT_TRUST:       "${LANG_FT_TRUST:-0.5}"
@@ -407,6 +428,9 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+
+volumes:
+  vpn_state:
 
 networks:
   vpnnet:

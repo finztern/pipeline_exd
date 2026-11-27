@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+"""Статический режим (без подписки): vpn.txt -> конфиг sing-box. Разбор ссылок общий с managed-режимом (links.py)."""
 import json
 import os
 import sys
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, unquote
+
+from links import SCHEMES, parse_link
 
 VPN_FILE = os.environ.get("VPN_FILE", "/vpn/vpn.txt")
 VLESS_URL = os.environ.get("VLESS_URL", "").strip()
@@ -12,7 +15,6 @@ BASE_PORT = int(os.environ.get("LINK_BASE_PORT", "10800"))
 LOG_LEVEL = os.environ.get("XRAY_LOG_LEVEL", "warning")
 OBS_URL = os.environ.get("OBSERVATORY_URL", "https://www.gstatic.com/generate_204")
 URLTEST_INTERVAL = os.environ.get("URLTEST_INTERVAL", "10m")
-SCHEMES = ("vless://", "hysteria2://", "hy2://")
 
 
 def read_links():
@@ -28,90 +30,6 @@ def read_links():
     if not links and VLESS_URL.startswith(SCHEMES):
         links = [VLESS_URL]
     return links
-
-
-def truthy(v):
-    return str(v).lower() in ("1", "true", "yes")
-
-
-def parse_vless(url):
-    p = urlparse(url)
-    q = {k: v[0] for k, v in parse_qs(p.query).items()}
-    uuid, server, port = unquote(p.username or ""), p.hostname, p.port
-    if not (uuid and server and port):
-        raise ValueError("нет uuid/host/port")
-
-    security = q.get("security", "none")
-    network = q.get("type", "tcp")
-    host = q.get("host", "")
-    path = unquote(q.get("path", "/"))
-    sni = q.get("sni") or host or server
-
-    ob = {"type": "vless", "server": server, "server_port": port, "uuid": uuid}
-    if q.get("flow") and network == "tcp":
-        ob["flow"] = q["flow"]
-
-    if network == "ws":
-        ob["transport"] = {"type": "ws", "path": path, **({"headers": {"Host": host}} if host else {})}
-    elif network == "httpupgrade":
-        ob["transport"] = {"type": "httpupgrade", "path": path, **({"host": host} if host else {})}
-    elif network == "grpc":
-        ob["transport"] = {"type": "grpc", "service_name": q.get("serviceName", "")}
-    elif network != "tcp":
-        raise ValueError(f"type={network!r} не поддерживается sing-box")
-
-    if security == "reality":
-        if not q.get("pbk"):
-            raise ValueError("reality без pbk")
-        ob["tls"] = {
-            "enabled": True,
-            "server_name": sni,
-            "utls": {"enabled": True, "fingerprint": q.get("fp", "chrome")},
-            "reality": {"enabled": True, "public_key": q["pbk"], "short_id": q.get("sid", "")},
-        }
-    elif security == "tls":
-        tls = {
-            "enabled": True,
-            "server_name": sni,
-            "insecure": truthy(q.get("allowInsecure", q.get("insecure", "0"))),
-            "utls": {"enabled": True, "fingerprint": q.get("fp", "chrome")},
-        }
-        if q.get("alpn"):
-            tls["alpn"] = q["alpn"].split(",")
-        ob["tls"] = tls
-    elif security != "none":
-        raise ValueError(f"security={security!r} не поддерживается")
-
-    return ob, f"{network}/{security}"
-
-
-def parse_hy2(url):
-    p = urlparse(url)
-    q = {k: v[0] for k, v in parse_qs(p.query).items()}
-    server, port = p.hostname, p.port
-    user, pwd = unquote(p.username or ""), unquote(p.password or "")
-    password = f"{user}:{pwd}" if pwd else user
-    if not (password and server and port):
-        raise ValueError("нет password/host/port")
-
-    tls = {
-        "enabled": True,
-        "server_name": q.get("sni") or server,
-        "insecure": truthy(q.get("insecure", "0")),
-        "alpn": ["h3"],
-    }
-    ob = {"type": "hysteria2", "server": server, "server_port": port, "password": password, "tls": tls}
-    if q.get("obfs"):
-        if q["obfs"] != "salamander":
-            raise ValueError(f"obfs={q['obfs']!r} не поддерживается")
-        ob["obfs"] = {"type": "salamander", "password": q.get("obfs-password", "")}
-    return ob, "udp/hysteria2"
-
-
-def parse_link(link):
-    if link.startswith("vless://"):
-        return parse_vless(link)
-    return parse_hy2(link)
 
 
 links = read_links()

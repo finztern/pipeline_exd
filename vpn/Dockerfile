@@ -16,12 +16,13 @@ RUN ARCH=$(uname -m) && \
 
 WORKDIR /vpn
 COPY entrypoint.sh /entrypoint.sh
-COPY build_config.py /vpn/build_config.py
-RUN chmod +x /entrypoint.sh
+COPY healthcheck.sh /vpn/healthcheck.sh
+COPY links.py subscription.py sbconfig.py manager.py build_config.py /vpn/
+RUN chmod +x /entrypoint.sh /vpn/healthcheck.sh && mkdir -p /state
 
-EXPOSE 1080 1081
+EXPOSE 1080 1081 9091
 
-HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=10s \
-    CMD curl -sf -x socks5h://127.0.0.1:1080 https://www.gstatic.com/generate_204 -o /dev/null || exit 1
+HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=90s \
+    CMD /vpn/healthcheck.sh || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
