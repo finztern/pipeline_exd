@@ -49,6 +49,7 @@ SEND_RETRIES = max(1, int(os.getenv("GPU_SEND_RETRIES", "4")))
 NLLB_ONLY   = {x.strip().lower() for x in os.getenv("NLLB_ONLY", "").split(",") if x.strip()}
 COMPUTE     = os.getenv("GPU_COMPUTE_TYPE", "int8")
 DEVICE      = os.getenv("GPU_DEVICE", "cuda")
+BLOCKING_SYNC = os.getenv("GPU_BLOCKING_SYNC", "1").strip().lower() in ("1", "true", "yes")
 MODELS_DIR  = os.getenv("CT2_MODELS_DIR", "/models")
 NLLB_NAME   = os.getenv("NLLB_MODEL", "facebook/nllb-200-distilled-600M")
 NLLB_OFF    = os.getenv("NLLB_DISABLE", "").strip().lower() in ("1", "true", "yes")
@@ -93,6 +94,23 @@ def _opus_map() -> dict:
 
 
 OPUS_MODELS = _opus_map()
+
+
+def _cuda_blocking_sync():
+    if DEVICE != "cuda" or not BLOCKING_SYNC:
+        return
+    import ctypes
+    for lib in ("libcudart.so.12", "libcudart.so"):
+        try:
+            rc = ctypes.CDLL(lib).cudaSetDeviceFlags(0x04)
+            log.info(f"cudaSetDeviceFlags(BlockingSync) {lib} rc={rc}")
+            return
+        except OSError:
+            continue
+    log.warning("libcudart не найден, BlockingSync не включён")
+
+
+_cuda_blocking_sync()
 
 FLORES = {
     "af": "afr_Latn", "ar": "arb_Arab", "bg": "bul_Cyrl", "bn": "ben_Beng", "ca": "cat_Latn",
