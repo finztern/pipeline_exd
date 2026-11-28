@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir \
     "aiohttp>=3.9.0" \
     "orjson>=3.9.0" \
     yake \
+    yake-rust \
     "tiktoken>=0.5.0" \
     "langdetect>=1.0.9" \
     "aioprometheus>=23.0.0"

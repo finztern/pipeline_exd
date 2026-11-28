@@ -1,10 +1,28 @@
-import yake, re, string
+import re, string
 from exorde_data import Keywords, Translation
+
+try:
+    import yake_rust
+    _RUST = True
+except ImportError:  # откат на pure-python YAKE
+    import yake
+    _RUST = False
 
 MAX_KEYWORD_LENGTH = 100
 
-kw_extractor1 = yake.KeywordExtractor(lan="en", n=1, dedupLim=0.9, dedupFunc='seqm', windowsSize=1, top=20)
-kw_extractor2 = yake.KeywordExtractor(lan="en", n=2, dedupLim=0.9, dedupFunc='seqm', windowsSize=7, top=10)
+if _RUST:
+    _y1 = yake_rust.Yake(language="en", ngrams=1, deduplication_threshold=0.9, window_size=1, remove_duplicates=True)
+    _y2 = yake_rust.Yake(language="en", ngrams=2, deduplication_threshold=0.9, window_size=7, remove_duplicates=True)
+
+    class _Ext:
+        def __init__(self, y, n): self.y, self.n = y, n
+        def extract_keywords(self, text): return self.y.get_n_best(text, n=self.n)
+
+    kw_extractor1 = _Ext(_y1, 20)
+    kw_extractor2 = _Ext(_y2, 10)
+else:
+    kw_extractor1 = yake.KeywordExtractor(lan="en", n=1, dedupLim=0.9, dedupFunc='seqm', windowsSize=1, top=20)
+    kw_extractor2 = yake.KeywordExtractor(lan="en", n=2, dedupLim=0.9, dedupFunc='seqm', windowsSize=7, top=10)
 
 def filter_strings(lst):
     out = []
